@@ -52,28 +52,24 @@ TIM_HandleTypeDef htim1;
 // TODO: dynamically reconfigure the injected channel before each commutation step (to track the floating phase).
 // TODO: try highres timer
 // NOTE: To avoid BEMF noise, sample during dead-time or middle of PWM pulse (align TRGO carefully).
-#define CLK ((float)170E6)
-#define MOD_FREQ (30000)
+
+
+
+const float CLK = 170E6;
+
+const int MOD_FREQ = 30000;
+
 uint16_t per = (int)( CLK / MOD_FREQ );
-
-typedef enum {
-    COMM_A_POS_B_NEG,
-    COMM_C_POS_B_NEG,
-    COMM_C_POS_A_NEG,
-    COMM_B_POS_A_NEG,
-    COMM_B_POS_C_NEG,
-    COMM_A_POS_C_NEG,
-    COMMUTATION_STEP_COUNT
-} CommutationStep;
-
-
-void ApplyCommutationStep(CommutationStep step, uint16_t duty_cycle_ticks);
+int max_dut = 5666;
+void commutator(int step, uint16_t duty_cycle_ticks);
 
 
 
-
-CommutationStep step = COMM_A_POS_B_NEG;
-uint16_t duty = 300; // out of TIM1->ARR
+int enable = 0;
+int comm_step = 0;
+int frq = 10;
+int lim = 3000;
+uint16_t comm_duty = 5666*0.77; // out of TIM1->ARR
 
 
 /* USER CODE END PV */
@@ -85,12 +81,159 @@ static void MX_DAC1_Init(void);
 static void MX_LPUART1_UART_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_ADC1_Init(void);
+void SetInjectedBEMFChannel(uint32_t adc_channel);
+
 /* USER CODE BEGIN PFP */
+#define PUTCHAR_PROTOTYPE int __io_putchar(int ch)
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+
+void ADC1_2_IRQHandler(void)
+{
+    HAL_ADC_IRQHandler(&hadc1);
+}
+
+void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
+{
+	static int ctr = 0;
+
+	if (hadc->Instance == ADC1)
+    {
+        uint16_t bemf = HAL_ADCEx_InjectedGetValue(hadc, ADC_INJECTED_RANK_1);
+
+        HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_14);  // e.g., toggle an LED
+
+        // Software zero-crossing logic here
+
+        // if a zero crossing is detected, then switch the phase
+        if (ctr >= lim)
+        {
+        	commutator(comm_step, comm_duty);
+
+        	ctr = 0;
+
+            ++comm_step;
+            if (comm_step == 6) comm_step = 0;
+
+        }
+        ++ctr;
+
+        //SetInjectedBEMFChannel(ADC_CHANNEL_3);
+    }
+}
+
+void SetInjectedBEMFChannel(uint32_t adc_channel)
+{
+    ADC_InjectionConfTypeDef sConfigInjected = {0};
+
+    sConfigInjected.InjectedChannel = adc_channel;
+    sConfigInjected.InjectedRank = ADC_INJECTED_RANK_1;
+    sConfigInjected.InjectedSamplingTime = ADC_SAMPLETIME_2CYCLES_5;
+    sConfigInjected.InjectedSingleDiff = ADC_SINGLE_ENDED;
+    sConfigInjected.InjectedOffsetNumber = ADC_OFFSET_NONE;
+    sConfigInjected.InjectedOffset = 0;
+    sConfigInjected.InjectedNbrOfConversion = 1;
+    sConfigInjected.InjectedDiscontinuousConvMode = DISABLE;
+    sConfigInjected.AutoInjectedConv = DISABLE;
+    sConfigInjected.QueueInjectedContext = DISABLE;
+    sConfigInjected.ExternalTrigInjecConv = ADC_EXTERNALTRIGINJEC_T1_TRGO;
+    sConfigInjected.ExternalTrigInjecConvEdge = ADC_EXTERNALTRIGINJECCONV_EDGE_RISING;
+    sConfigInjected.InjecOversamplingMode = DISABLE;
+
+    HAL_ADCEx_InjectedConfigChannel(&hadc1, &sConfigInjected);
+}
+
+void EXTI15_10_IRQHandler(void)
+{
+    HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_13);
+}
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    if (GPIO_Pin == GPIO_PIN_13)
+    {
+        // This gets called when PA0 has an edge event
+        // Your interrupt logic goes here
+        HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);  // e.g., toggle an LED
+//    	++comm_step;
+//    	if (comm_step == 6) comm_step = 0;
+//    	commutator(comm_step, comm_duty);
+    	frq = frq + 20;
+    	lim = MOD_FREQ / frq;
+
+    	printf("modfreq=%d, lim=%d\n", frq, lim);
+
+
+    }
+}
+
+
+void commutator(int step, uint16_t duty)
+{
+
+	//printf("phs=%d, dut=%d\n", step, duty);
+
+    TIM_OC_InitTypeDef sConfig = {
+        .OCPolarity = TIM_OCPOLARITY_HIGH,
+        .OCNPolarity = TIM_OCNPOLARITY_HIGH,
+        .OCFastMode = TIM_OCFAST_DISABLE,
+        .OCIdleState = TIM_OCIDLESTATE_RESET,
+        .OCNIdleState = TIM_OCNIDLESTATE_RESET,
+    };
+
+    // Determine active channels
+    uint32_t source = 0, sink = 0, float_channel = 0;
+
+    switch (step)
+    {
+        case 0: source = TIM_CHANNEL_1; sink = TIM_CHANNEL_2; float_channel = TIM_CHANNEL_3; break;
+        case 1: source = TIM_CHANNEL_1; sink = TIM_CHANNEL_3; float_channel = TIM_CHANNEL_2; break;
+        case 2: source = TIM_CHANNEL_2; sink = TIM_CHANNEL_3; float_channel = TIM_CHANNEL_1; break;
+        case 3: source = TIM_CHANNEL_2; sink = TIM_CHANNEL_1; float_channel = TIM_CHANNEL_3; break;
+        case 4: source = TIM_CHANNEL_3; sink = TIM_CHANNEL_1; float_channel = TIM_CHANNEL_2; break;
+        case 5: source = TIM_CHANNEL_3; sink = TIM_CHANNEL_2; float_channel = TIM_CHANNEL_1; break;
+    }
+
+    // Stop all outputs first
+    for (int ch = 1; ch <= 3; ++ch) {
+        uint32_t chx = (ch == 1) ? TIM_CHANNEL_1 :
+                       (ch == 2) ? TIM_CHANNEL_2 :
+                                   TIM_CHANNEL_3;
+
+        HAL_TIM_PWM_Stop(&htim1, chx);
+        HAL_TIMEx_PWMN_Stop(&htim1, chx);
+        __HAL_TIM_SET_COMPARE(&htim1, chx, 0);
+    }
+
+    // Configure and enable SOURCE (high-side PWM)
+    sConfig.OCMode = TIM_OCMODE_PWM1;
+    sConfig.Pulse = duty;
+    HAL_TIM_PWM_ConfigChannel(&htim1, &sConfig, source);
+    HAL_TIM_PWM_Start(&htim1, source);
+    HAL_TIMEx_PWMN_Start(&htim1, source);
+
+    // Configure and enable SINK (low-side PWM)
+    sConfig.OCMode = TIM_OCMODE_PWM2;
+    sConfig.Pulse = duty;
+    HAL_TIM_PWM_ConfigChannel(&htim1, &sConfig, sink);
+    HAL_TIM_PWM_Start(&htim1, sink);
+    HAL_TIMEx_PWMN_Start(&htim1, sink);
+
+    // Configure and enable SINK (low-side PWM)
+    //sConfig.OCMode = TIM_OCMODE_FORCED_INACTIVE;
+    //sConfig.Pulse = 0;
+    //HAL_TIM_PWM_ConfigChannel(&htim1, &sConfig, float_channel);
+    //HAL_TIM_PWM_Start(&htim1, float_channel);
+    //HAL_TIMEx_PWMN_Start(&htim1, float_channel);
+
+
+    // FLOATING PHASE: leave disabled (already done in the for-loop)
+    // optionally, set that phase's pins to analog mode or GPIO hi-Z if needed
+}
+
 
 /* USER CODE END 0 */
 
@@ -146,8 +289,9 @@ int main(void)
   HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
 
-  ApplyCommutationStep(COMM_A_POS_B_NEG, per>>2);
+  HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_3);
 
+  commutator(comm_step, comm_duty);
 
 
   /* USER CODE END 2 */
@@ -515,112 +659,15 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
-void ADC1_2_IRQHandler(void)
+PUTCHAR_PROTOTYPE
 {
-    HAL_ADC_IRQHandler(&hadc1);
+  /* Place your implementation of fputc here */
+  /* e.g. write a character to the USART1 and Loop until the end of transmission */
+  HAL_UART_Transmit(&hlpuart1, (uint8_t *)&ch, 1, 0xFFFF);
+
+  return ch;
 }
 
-void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
-{
-    if (hadc->Instance == ADC1)
-    {
-        uint16_t bemf = HAL_ADCEx_InjectedGetValue(hadc, ADC_INJECTED_RANK_1);
-        HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_14);  // e.g., toggle an LED
-
-        // Software zero-crossing logic here
-
-        // if a zero crossing is detected, then switch the phase
-    }
-}
-
-void EXTI15_10_IRQHandler(void)
-{
-    HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_13);
-}
-void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
-{
-//    if (GPIO_Pin == GPIO_PIN_13) {
-        // This gets called when PA0 has an edge event
-        // Your interrupt logic goes here
-        HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_13);  // e.g., toggle an LED
-        HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);  // e.g., toggle an LED
-//    }
-}
-
-
-void ApplyCommutationStep(CommutationStep step, uint16_t duty)
-{
-    // Stop all 6 PWM outputs
-    HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);
-    HAL_TIMEx_PWMN_Stop(&htim1, TIM_CHANNEL_1);
-    HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_2);
-    HAL_TIMEx_PWMN_Stop(&htim1, TIM_CHANNEL_2);
-    HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_3);
-    HAL_TIMEx_PWMN_Stop(&htim1, TIM_CHANNEL_3);
-
-    // Reset all duty cycles
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 0);
-
-    // Two phases PWM’d, one floating (disabled)
-    switch (step)
-    {
-        case COMM_A_POS_B_NEG:
-            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, duty); // A+
-            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, duty); // B−
-            HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
-            HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
-            HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
-            HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_2);
-            break;
-
-        case COMM_C_POS_B_NEG:
-            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, duty); // C+
-            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, duty); // B−
-            HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
-            HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3);
-            HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
-            HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_2);
-            break;
-
-        case COMM_C_POS_A_NEG:
-            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, duty); // C+
-            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, duty); // A−
-            HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
-            HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3);
-            HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
-            HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
-            break;
-
-        case COMM_B_POS_A_NEG:
-            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, duty); // B+
-            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, duty); // A−
-            HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
-            HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_2);
-            HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
-            HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
-            break;
-
-        case COMM_B_POS_C_NEG:
-            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, duty); // B+
-            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, duty); // C−
-            HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
-            HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_2);
-            HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
-            HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3);
-            break;
-
-        case COMM_A_POS_C_NEG:
-            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, duty); // A+
-            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, duty); // C−
-            HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
-            HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_1);
-            HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
-            HAL_TIMEx_PWMN_Start(&htim1, TIM_CHANNEL_3);
-            break;
-    }
-}
 
 
 /* USER CODE END 4 */
