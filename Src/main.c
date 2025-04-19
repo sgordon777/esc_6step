@@ -18,11 +18,11 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include <stdio.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -37,7 +37,10 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-
+#ifndef __HAL_TIM_SET_TRGO
+#define __HAL_TIM_SET_TRGO(__HANDLE__, __TRGO__) \
+  MODIFY_REG((__HANDLE__)->Instance->CR2, TIM_CR2_MMS, (__TRGO__))
+#endif
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -50,48 +53,65 @@ UART_HandleTypeDef hlpuart1;
 TIM_HandleTypeDef htim1;
 
 /* USER CODE BEGIN PV */
-// TODO: dynamically reconfigure the injected channel before each commutation step (to track the floating phase).
+// throttle
+//
+// TODO: x track RPM
+// TODO: x throttle
+// TODO: x Get trip point automatically (doesn't track voltage changes)
+// TODO: PWM+soid modulation
 // TODO: try highres timer
-// TODO:  TRGO Alignment (for best BEMF sample)
-//	You're currently using:
-//	sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
-//	This triggers at counter == 0, which may not fall in the clean middle of the PWM cycle.
-//	Suggestion: use a spare channel (e.g., TIM1_CH4) set to a known value in the middle of the PWM pulse, then:
-//	sMasterConfig.MasterOutputTrigger = TIM_TRGO_OC4REF;
-//	This gives you tight control over sample point.
-// NOTE: To avoid BEMF noise, sample during dead-time or middle of PWM pulse (align TRGO carefully).
+// TODO: lookup table for commutator step switchblock
+// TODO: rewrite time-critical bits in LL
+// TODO: Make time ch4 handling a one-time, remove from commutation func
+// TODO: Macros for trigger, tasks
 
 
 #define ADC_BUF_SZ (2048)
+#define TRG_BUF_SZ (2048)
+#define TRIG_IDLE (0)
+#define TRIG_PENDING (1)
+#define TRIG_COMPLETE (2)
+
 const float CLK = 170E6;
 const int MOD_FREQ = 30000;
 uint16_t per = (int)( CLK / MOD_FREQ );
 int max_dut = 5666;
 void commutator(int step, uint16_t duty_cycle_ticks);
 int16_t adc_buf[ADC_BUF_SZ];
-int16_t lim_downto = 400;
-int16_t lim_upto = 400;
+uint32_t trg_buf[TRG_BUF_SZ];
 
 
 // param
 float frq_start = 10;  // hz
 float frq_stop = 400;  // hz
-float frq_inc = 400; // hz/sec
-uint16_t comm_duty = 5666 * 0.777; // out of TIM1->ARR
-//int lim_high =
+float frq_inc = 500; // hz/sec
+uint16_t comm_duty = 5666 * 1 ; // out of TIM1->ARR
+int hold_end_spinup = 0;
+int motor_pp = 7;
+float motor_res = 10;
+float motor_inductino = 1E-5;
 
+const int STATE_MEASURE = 0;
+const int STATE_SPINUP = 1;
+const int STATE_COMMUTATE = 2;
 
 
 // global
 int adc_ndx = 0;
+int trg_ndx = 0;
 int comm_step = 0;
 int enable = 0;
 float frq_commtask = 10;
 int lim_commtask = 3000;  // MOD_FREQ / comm_freq
-int comm_state = 0; // 0=windup, 1=bemf, 2=hal
+int comm_state = STATE_MEASURE; // 0 = measure, 1=windup, 2=commmutation
 int zc_pol = 0;
 int switched  = 0;
-int commutate_count = 0;
+int comm_stabilize_count = 0;
+float rpm_est = 0;
+uint16_t ref;
+uint32_t trig_measure = 0;
+const uint32_t MEASURE_THRESH = ADC_BUF_SZ / 2;
+speed_ndx = 0; // 0=
 
 /* USER CODE END PV */
 
@@ -102,8 +122,6 @@ static void MX_DAC1_Init(void);
 static void MX_LPUART1_UART_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_ADC1_Init(void);
-void SetInjectedBEMFChannel(uint32_t adc_channel);
-
 /* USER CODE BEGIN PFP */
 #define PUTCHAR_PROTOTYPE int __io_putchar(int ch)
 
@@ -129,16 +147,24 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 		static uint16_t last_bemf = 0, bemf = 0;
         uint16_t bemf_raw = HAL_ADCEx_InjectedGetValue(hadc, ADC_INJECTED_RANK_1);
 
-        bemf = (bemf_raw + last_bemf) / 2;
+        //bemf = (bemf_raw + last_bemf) / 2;
+        bemf = bemf_raw;
         last_bemf = bemf_raw;
 
         HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_14);  // e.g., toggle an LED
 
         adc_buf[adc_ndx] = bemf;
 
-        // Software zero-crossing logic here
+        if (comm_state == STATE_MEASURE)
+        {
+        	if (adc_ndx >= MEASURE_THRESH && trig_measure == TRIG_IDLE)
+        	{
+        		// schedule ref measurement
+        		trig_measure = TRIG_PENDING;
+        	}
+        }
 
-        if (comm_state == 0)
+        else if (comm_state == STATE_SPINUP)
         {
 			if (ctr_commtask >= lim_commtask)
 			{
@@ -146,51 +172,43 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 				ctr_commtask = 0;
 				++comm_step;
 				if (comm_step == 6) comm_step = 0;
-
-	#if 0
-				if (switched == 1)
-				{
-					adc_buf[adc_ndx] = 0x7fff;
-					switched = 0;
-				}
-				else
-				{
-					adc_buf[adc_ndx] = 0x3fff;
-				}
-	#endif
 			}
 			++ctr_commtask;
         }
-        else if (comm_state == 1)
+        else if (comm_state == STATE_COMMUTATE)
         {
             // if a zero crossing is detected, then switch the phase
-        	if (commutate_count > 4) // allow phase to stabilize
+        	if (comm_stabilize_count > 4) // allow phase to stabilize
         	{
-				if (zc_pol == 0 && bemf < lim_downto)
+        		int sw = 0;
+				if (zc_pol == 0 && bemf < ref)
 				{
+					sw = 1;
+				}
+
+				else if (zc_pol == 1 && bemf > ref)
+				{
+					sw = 1;
+				}
+				if (sw)
+				{
+					static uint32_t last_det = 0;
 					commutator(comm_step, comm_duty);
 					++comm_step;
 					if (comm_step == 6) comm_step = 0;
+					trg_buf[trg_ndx] = DWT->CYCCNT;
+					if (trg_ndx >= TRG_BUF_SZ) trg_ndx = 0;
+					uint32_t dt = (trg_buf[trg_ndx] - last_det);
+					rpm_est = 60.0 / ( ((float)dt/CLK) * 6 * motor_pp );
+					last_det = trg_buf[trg_ndx];
+					++trg_ndx;
 				}
-
-				else if (zc_pol == 1 && bemf > lim_upto)
-				{
-					commutator(comm_step, comm_duty);
-					++comm_step;
-					if (comm_step == 6) comm_step = 0;
-				}
-
-
         	}
-
         }
-
-        //SetInjectedBEMFChannel(ADC_CHANNEL_3);
-
 
         ++adc_ndx;
         if (adc_ndx >= ADC_BUF_SZ) adc_ndx = 0;
-        ++commutate_count;
+        ++comm_stabilize_count;
 
     }
 }
@@ -210,6 +228,7 @@ void SetInjectedBEMFChannel(uint32_t adc_channel)
     sConfigInjected.AutoInjectedConv = DISABLE;
     sConfigInjected.QueueInjectedContext = DISABLE;
     sConfigInjected.ExternalTrigInjecConv = ADC_EXTERNALTRIGINJEC_T1_TRGO;
+
     sConfigInjected.ExternalTrigInjecConvEdge = ADC_EXTERNALTRIGINJECCONV_EDGE_RISING;
     sConfigInjected.InjecOversamplingMode = DISABLE;
 
@@ -231,10 +250,30 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 //    	if (comm_step == 6) comm_step = 0;
 //    	commutator(comm_step, comm_duty);
 
+        if (speed_ndx == 0)
+        {
+        	comm_duty = 5666 * 0.59;
+        	speed_ndx = 1;
+        }
+        else if (speed_ndx == 1)
+    	{
+        	comm_duty = 5666 * 0.67;
+        	speed_ndx = 2;
+        }
+        else if (speed_ndx == 2)
+        {
+        	comm_duty = 5666 * 0.8;
+        	speed_ndx = 3;
+        }
+        else if (speed_ndx == 3)
+        {
+        	comm_duty = 5666 * 1.0;
+        	speed_ndx = 0;
+        }
+
 
     }
 }
-
 
 void commutator(int step, uint16_t duty)
 {
@@ -250,7 +289,7 @@ void commutator(int step, uint16_t duty)
     };
 
     // Determine active channels
-    uint32_t source = 0, sink = 0, float_channel = 0, adc_float_channel = 0 ;
+    uint32_t source = 0, sink = 0, float_channel=0, adc_float_channel=0 ;
 
     switch (step)
     {
@@ -312,6 +351,11 @@ void commutator(int step, uint16_t duty)
         __HAL_TIM_SET_COMPARE(&htim1, chx, 0);
     }
 
+    // channel4 triggers the ADC. Set it to per/2 so ADC is triggered at center of PWM cycle
+    HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_4);
+    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, per/2);
+
+
     // Configure and enable SOURCE (high-side PWM)
     sConfig.OCMode = TIM_OCMODE_PWM1;
     sConfig.Pulse = duty;
@@ -326,6 +370,9 @@ void commutator(int step, uint16_t duty)
     HAL_TIM_PWM_Start(&htim1, sink);
     HAL_TIMEx_PWMN_Start(&htim1, sink);
 
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
+
+
     // Configure and enable SINK (low-side PWM)
     //sConfig.OCMode = TIM_OCMODE_FORCED_INACTIVE;
     //sConfig.Pulse = 0;
@@ -336,7 +383,7 @@ void commutator(int step, uint16_t duty)
 
     // FLOATING PHASE: leave disabled (already done in the for-loop)
     // optionally, set that phase's pins to analog mode or GPIO hi-Z if needed
-    commutate_count = 0;
+    comm_stabilize_count = 0;
 }
 
 
@@ -381,6 +428,9 @@ int main(void)
   MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
 
+
+  HAL_Delay(50);
+
   // enable ADC interrupt
   __HAL_ADC_ENABLE_IT(&hadc1, ADC_IT_JEOC);
   __HAL_ADC_GET_IT_SOURCE(&hadc1, ADC_IT_JEOC);
@@ -407,46 +457,82 @@ int main(void)
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 
-  int el_1ms = CLK / 100;
-  uint32_t t0 = DWT->CYCCNT;
+  uint32_t TASK_HANDLER_LIM = CLK / 100;
+  uint32_t TASK_HANDLER_EL ;
+  uint32_t TASK_HANDLER_t0 = DWT->CYCCNT ;
+
+  uint32_t DIAG_HANDLER_LIM = CLK / 1;
+  uint32_t DIAG_HANDLER_EL ;
+  uint32_t DIAG_HANDLER_t0 = DWT->CYCCNT ;
 
   frq_commtask = frq_start;
   lim_commtask = MOD_FREQ / frq_commtask;
 
-  printf("starting\n");
+  // set ref channel for startup
+  SetInjectedBEMFChannel(ADC_CHANNEL_14);
+  printf("state=%d, trig_measure=%d, RPM=%f, ref=%u \n", comm_state, trig_measure, rpm_est, ref);
+
   while (1)
   {
 
-#if 1
-	  // startup sweep task
-	  uint32_t elapsed = DWT->CYCCNT - t0;
-	  if (elapsed >= el_1ms)
+	  // spinup handler
+	  TASK_HANDLER_EL = DWT->CYCCNT - TASK_HANDLER_t0;
+	  if (TASK_HANDLER_EL >= TASK_HANDLER_LIM)
 	  {
-		  //printf("frq=%f, lim=%d\n", frq_commtask, lim_commtask);
-		  if (comm_state == 0)
+		  if (comm_state == STATE_MEASURE)
+		  {
+			  // check measure trigger
+			  if (trig_measure == TRIG_PENDING)
+			  {
+				  float x=0;
+				  float one_over_sz = 1.0 / MEASURE_THRESH;
+				  for (int i=0; i<MEASURE_THRESH; i++ )
+				  {
+					  x = x + adc_buf[i] * one_over_sz;
+					  //printf("ndx=%d, raw=%d val=%f\n", i, adc_buf[i] ,x);
+				  }
+				  ref = (int)x / 2;
+
+				  trig_measure = TRIG_COMPLETE;
+				  // start spinup
+				  comm_state = STATE_SPINUP;
+
+				  printf("transitioning from measure to spinup, vref=%f x=%u \n", x, ref);
+
+
+			  }
+		  }
+		  else if (comm_state == STATE_SPINUP)
 		  {
 			  if (frq_commtask < frq_stop)
 			  {
 				  frq_commtask += frq_inc / 100.0;
 				  lim_commtask = MOD_FREQ / frq_commtask;
-
-				  //printf("frq=%f, lim=%d\n", frq_commtask, lim_commtask);
 			  }
 			  else
 			  {
-				  if (comm_state == 0)
+				  if (comm_state == STATE_SPINUP && hold_end_spinup == 0)
 				  {
-					  comm_state = 1;
-					  printf("switching to BEMF commutation\n");
+					  comm_state = STATE_COMMUTATE;
+					  printf("transitioning from spin-up to BEMF commutation\n");
 				  }
 			  }
 		  }
-		  t0 = DWT->CYCCNT;
+		  TASK_HANDLER_t0 = DWT->CYCCNT;
 	  }
-#endif
+
+
+	  // spinup handler
+	  DIAG_HANDLER_EL = DWT->CYCCNT - DIAG_HANDLER_t0;
+	  if (DIAG_HANDLER_EL >= DIAG_HANDLER_LIM)
+	  {
+		  printf("state=%d, trig_measure=%d, RPM=%f, ref=%u \n", comm_state, trig_measure, rpm_est, ref);
+		  DIAG_HANDLER_t0 = DWT->CYCCNT;
+	  }
 
 
     /* USER CODE END WHILE */
+
     /* USER CODE BEGIN 3 */
 
 
@@ -689,7 +775,7 @@ static void MX_TIM1_Init(void)
   htim1.Instance = TIM1;
   htim1.Init.Prescaler = 0;
   htim1.Init.CounterMode = TIM_COUNTERMODE_CENTERALIGNED1;
-  htim1.Init.Period = per;  // 170M / per = MOD_FREQ : per = 170M / MOD_FREQ
+  htim1.Init.Period = per;
   htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim1.Init.RepetitionCounter = 0;
   htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
@@ -723,6 +809,10 @@ static void MX_TIM1_Init(void)
   {
     Error_Handler();
   }
+  if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
+  {
+    Error_Handler();
+  }
   sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
   sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
   sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
@@ -741,6 +831,13 @@ static void MX_TIM1_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN TIM1_Init 2 */
+  //sMasterConfig.MasterOutputTrigger = TIM_TRGO_OC4REF;
+  htim1.Instance->CCR4 = per / 2;
+
+  // Manually override the TIM1 TRGO trigger to use CH4 compare event
+  __HAL_TIM_SET_TRGO(&htim1, TIM_TRGO_OC4REF);
+
+
 
   /* USER CODE END TIM1_Init 2 */
   HAL_TIM_MspPostInit(&htim1);
