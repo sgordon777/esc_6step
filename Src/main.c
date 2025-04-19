@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include <stdio.h>
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -51,26 +52,46 @@ TIM_HandleTypeDef htim1;
 /* USER CODE BEGIN PV */
 // TODO: dynamically reconfigure the injected channel before each commutation step (to track the floating phase).
 // TODO: try highres timer
+// TODO:  TRGO Alignment (for best BEMF sample)
+//	You're currently using:
+//	sMasterConfig.MasterOutputTrigger = TIM_TRGO_UPDATE;
+//	This triggers at counter == 0, which may not fall in the clean middle of the PWM cycle.
+//	Suggestion: use a spare channel (e.g., TIM1_CH4) set to a known value in the middle of the PWM pulse, then:
+//	sMasterConfig.MasterOutputTrigger = TIM_TRGO_OC4REF;
+//	This gives you tight control over sample point.
 // NOTE: To avoid BEMF noise, sample during dead-time or middle of PWM pulse (align TRGO carefully).
 
 
-
+#define ADC_BUF_SZ (2048)
 const float CLK = 170E6;
-
 const int MOD_FREQ = 30000;
-
 uint16_t per = (int)( CLK / MOD_FREQ );
 int max_dut = 5666;
 void commutator(int step, uint16_t duty_cycle_ticks);
+int16_t adc_buf[ADC_BUF_SZ];
+int16_t lim_downto = 400;
+int16_t lim_upto = 400;
+
+
+// param
+float frq_start = 10;  // hz
+float frq_stop = 400;  // hz
+float frq_inc = 400; // hz/sec
+uint16_t comm_duty = 5666 * 0.777; // out of TIM1->ARR
+//int lim_high =
 
 
 
-int enable = 0;
+// global
+int adc_ndx = 0;
 int comm_step = 0;
-int frq = 10;
-int lim = 3000;
-uint16_t comm_duty = 5666*0.77; // out of TIM1->ARR
-
+int enable = 0;
+float frq_commtask = 10;
+int lim_commtask = 3000;  // MOD_FREQ / comm_freq
+int comm_state = 0; // 0=windup, 1=bemf, 2=hal
+int zc_pol = 0;
+int switched  = 0;
+int commutate_count = 0;
 
 /* USER CODE END PV */
 
@@ -97,32 +118,80 @@ void ADC1_2_IRQHandler(void)
     HAL_ADC_IRQHandler(&hadc1);
 }
 
+
+
 void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
-	static int ctr = 0;
+	static int ctr_commtask = 0;
 
 	if (hadc->Instance == ADC1)
     {
-        uint16_t bemf = HAL_ADCEx_InjectedGetValue(hadc, ADC_INJECTED_RANK_1);
+		static uint16_t last_bemf = 0, bemf = 0;
+        uint16_t bemf_raw = HAL_ADCEx_InjectedGetValue(hadc, ADC_INJECTED_RANK_1);
+
+        bemf = (bemf_raw + last_bemf) / 2;
+        last_bemf = bemf_raw;
 
         HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_14);  // e.g., toggle an LED
 
+        adc_buf[adc_ndx] = bemf;
+
         // Software zero-crossing logic here
 
-        // if a zero crossing is detected, then switch the phase
-        if (ctr >= lim)
+        if (comm_state == 0)
         {
-        	commutator(comm_step, comm_duty);
+			if (ctr_commtask >= lim_commtask)
+			{
+				commutator(comm_step, comm_duty);
+				ctr_commtask = 0;
+				++comm_step;
+				if (comm_step == 6) comm_step = 0;
 
-        	ctr = 0;
+	#if 0
+				if (switched == 1)
+				{
+					adc_buf[adc_ndx] = 0x7fff;
+					switched = 0;
+				}
+				else
+				{
+					adc_buf[adc_ndx] = 0x3fff;
+				}
+	#endif
+			}
+			++ctr_commtask;
+        }
+        else if (comm_state == 1)
+        {
+            // if a zero crossing is detected, then switch the phase
+        	if (commutate_count > 4) // allow phase to stabilize
+        	{
+				if (zc_pol == 0 && bemf < lim_downto)
+				{
+					commutator(comm_step, comm_duty);
+					++comm_step;
+					if (comm_step == 6) comm_step = 0;
+				}
 
-            ++comm_step;
-            if (comm_step == 6) comm_step = 0;
+				else if (zc_pol == 1 && bemf > lim_upto)
+				{
+					commutator(comm_step, comm_duty);
+					++comm_step;
+					if (comm_step == 6) comm_step = 0;
+				}
+
+
+        	}
 
         }
-        ++ctr;
 
         //SetInjectedBEMFChannel(ADC_CHANNEL_3);
+
+
+        ++adc_ndx;
+        if (adc_ndx >= ADC_BUF_SZ) adc_ndx = 0;
+        ++commutate_count;
+
     }
 }
 
@@ -161,10 +230,6 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 //    	++comm_step;
 //    	if (comm_step == 6) comm_step = 0;
 //    	commutator(comm_step, comm_duty);
-    	frq = frq + 20;
-    	lim = MOD_FREQ / frq;
-
-    	printf("modfreq=%d, lim=%d\n", frq, lim);
 
 
     }
@@ -185,17 +250,56 @@ void commutator(int step, uint16_t duty)
     };
 
     // Determine active channels
-    uint32_t source = 0, sink = 0, float_channel = 0;
+    uint32_t source = 0, sink = 0, float_channel = 0, adc_float_channel = 0 ;
 
     switch (step)
     {
-        case 0: source = TIM_CHANNEL_1; sink = TIM_CHANNEL_2; float_channel = TIM_CHANNEL_3; break;
-        case 1: source = TIM_CHANNEL_1; sink = TIM_CHANNEL_3; float_channel = TIM_CHANNEL_2; break;
-        case 2: source = TIM_CHANNEL_2; sink = TIM_CHANNEL_3; float_channel = TIM_CHANNEL_1; break;
-        case 3: source = TIM_CHANNEL_2; sink = TIM_CHANNEL_1; float_channel = TIM_CHANNEL_3; break;
-        case 4: source = TIM_CHANNEL_3; sink = TIM_CHANNEL_1; float_channel = TIM_CHANNEL_2; break;
-        case 5: source = TIM_CHANNEL_3; sink = TIM_CHANNEL_2; float_channel = TIM_CHANNEL_1; break;
+        case 0:
+        	source = TIM_CHANNEL_1;
+        	sink = TIM_CHANNEL_2;
+        	float_channel = TIM_CHANNEL_3;
+        	adc_float_channel = ADC_CHANNEL_11;
+        	switched = 1;
+        	zc_pol = 0;
+        	break;
+        case 1:
+        	source = TIM_CHANNEL_1;
+        	sink = TIM_CHANNEL_3;
+        	float_channel = TIM_CHANNEL_2;
+        	adc_float_channel = ADC_CHANNEL_2;
+        	zc_pol = 1;
+        	break;
+        case 2:
+        	source = TIM_CHANNEL_2;
+        	sink = TIM_CHANNEL_3;
+        	float_channel = TIM_CHANNEL_1;
+        	adc_float_channel = ADC_CHANNEL_1;
+        	zc_pol = 0;
+        	break;
+        case 3:
+        	source = TIM_CHANNEL_2;
+        	sink = TIM_CHANNEL_1;
+        	float_channel = TIM_CHANNEL_3;
+        	adc_float_channel = ADC_CHANNEL_11;
+        	zc_pol = 1;
+        	break;
+        case 4:
+        	source = TIM_CHANNEL_3;
+        	sink = TIM_CHANNEL_1;
+        	float_channel = TIM_CHANNEL_2;
+        	adc_float_channel = ADC_CHANNEL_2;
+        	zc_pol = 0;
+        	break;
+        case 5:
+        	source = TIM_CHANNEL_3;
+        	sink = TIM_CHANNEL_2;
+        	float_channel = TIM_CHANNEL_1;
+        	adc_float_channel = ADC_CHANNEL_1;
+        	zc_pol = 1;
+        	break;
     }
+
+	SetInjectedBEMFChannel(adc_float_channel);
 
     // Stop all outputs first
     for (int ch = 1; ch <= 3; ++ch) {
@@ -232,6 +336,7 @@ void commutator(int step, uint16_t duty)
 
     // FLOATING PHASE: leave disabled (already done in the for-loop)
     // optionally, set that phase's pins to analog mode or GPIO hi-Z if needed
+    commutate_count = 0;
 }
 
 
@@ -288,21 +393,63 @@ int main(void)
   HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
-
-  HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_3);
+  // enable
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_3, GPIO_PIN_SET);
 
   commutator(comm_step, comm_duty);
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 
 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+
+  int el_1ms = CLK / 100;
+  uint32_t t0 = DWT->CYCCNT;
+
+  frq_commtask = frq_start;
+  lim_commtask = MOD_FREQ / frq_commtask;
+
+  printf("starting\n");
   while (1)
   {
-    /* USER CODE END WHILE */
 
+#if 1
+	  // startup sweep task
+	  uint32_t elapsed = DWT->CYCCNT - t0;
+	  if (elapsed >= el_1ms)
+	  {
+		  //printf("frq=%f, lim=%d\n", frq_commtask, lim_commtask);
+		  if (comm_state == 0)
+		  {
+			  if (frq_commtask < frq_stop)
+			  {
+				  frq_commtask += frq_inc / 100.0;
+				  lim_commtask = MOD_FREQ / frq_commtask;
+
+				  //printf("frq=%f, lim=%d\n", frq_commtask, lim_commtask);
+			  }
+			  else
+			  {
+				  if (comm_state == 0)
+				  {
+					  comm_state = 1;
+					  printf("switching to BEMF commutation\n");
+				  }
+			  }
+		  }
+		  t0 = DWT->CYCCNT;
+	  }
+#endif
+
+
+    /* USER CODE END WHILE */
     /* USER CODE BEGIN 3 */
+
+
   }
   /* USER CODE END 3 */
 }
