@@ -55,7 +55,7 @@ TIM_HandleTypeDef htim1;
 /* USER CODE BEGIN PV */
 // throttle
 //
-// TODO: x track RPM
+// TODO: fix RPM
 // TODO: x throttle
 // TODO: x Get trip point automatically (doesn't track voltage changes)
 // TODO: PWM+soid modulation
@@ -71,7 +71,16 @@ TIM_HandleTypeDef htim1;
 #define TRIG_IDLE (0)
 #define TRIG_PENDING (1)
 #define TRIG_COMPLETE (2)
+const int STATE_MEASURE = 0;
+const int STATE_SPINUP = 1;
+const int STATE_COMMUTATE = 2;
 
+// MACRO
+#define LPF(x, y, A, B) ( x*A + y*B )
+#define TRIGGER_START(x)    (x = (x==TRIG_IDLE) ? TRIG_PENDING : x     )
+#define TRIGGER_COMPLETE(x) (x = (x==TRIG_PENDING) ? TRIG_COMPLETE : x )
+#define TRIGGER_RESET(x)    (x = TRIG_IDLE)
+#define TRIGGER_STAT(x) (x)
 const float CLK = 170E6;
 const int MOD_FREQ = 30000;
 uint16_t per = (int)( CLK / MOD_FREQ );
@@ -82,18 +91,22 @@ uint32_t trg_buf[TRG_BUF_SZ];
 
 
 // param
+//#define COMM_MODE_PWM_COMPLEMENTARY
+//#define COMM_MODE_PWMHIGH
+#define COMM_MODE_PWMLOW
+
 float frq_start = 10;  // hz
-float frq_stop = 400;  // hz
+float frq_stop = 500;  // hz
 float frq_inc = 500; // hz/sec
-uint16_t comm_duty = 5666 * 1 ; // out of TIM1->ARR
+uint16_t comm_duty = 5666 * 0.67 ; // out of TIM1->ARR
 int hold_end_spinup = 0;
 int motor_pp = 7;
 float motor_res = 10;
 float motor_inductino = 1E-5;
+uint32_t dt = 1;
+float ALFA_RPM = 0.001;
+float ALFA_RPM1 = 0.999;
 
-const int STATE_MEASURE = 0;
-const int STATE_SPINUP = 1;
-const int STATE_COMMUTATE = 2;
 
 
 // global
@@ -111,7 +124,8 @@ float rpm_est = 0;
 uint16_t ref;
 uint32_t trig_measure = 0;
 const uint32_t MEASURE_THRESH = ADC_BUF_SZ / 2;
-speed_ndx = 0; // 0=
+speed_ndx = 1; // 0=
+float ttf;
 
 /* USER CODE END PV */
 
@@ -157,15 +171,17 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 
         if (comm_state == STATE_MEASURE)
         {
-        	if (adc_ndx >= MEASURE_THRESH && trig_measure == TRIG_IDLE)
+        	// one-time state to measure ref voltage before motor running
+        	if (adc_ndx >= MEASURE_THRESH)
         	{
         		// schedule ref measurement
-        		trig_measure = TRIG_PENDING;
+        		TRIGGER_START(trig_measure);
         	}
         }
 
         else if (comm_state == STATE_SPINUP)
         {
+        	// manage spin-up state
 			if (ctr_commtask >= lim_commtask)
 			{
 				commutator(comm_step, comm_duty);
@@ -177,32 +193,29 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
         }
         else if (comm_state == STATE_COMMUTATE)
         {
-            // if a zero crossing is detected, then switch the phase
-        	if (comm_stabilize_count > 4) // allow phase to stabilize
-        	{
-        		int sw = 0;
-				if (zc_pol == 0 && bemf < ref)
-				{
-					sw = 1;
-				}
+            // Manage commutating state: detect ZC and commutate
+			if (    (comm_stabilize_count > 4) &&
+					(zc_pol == 0 && bemf < ref) || (zc_pol == 1 && bemf > ref) )
+			{
+				// zero cross detected. Commutate the motor.
+				static uint32_t last_t = 0;
+				static float y1 = 0;
 
-				else if (zc_pol == 1 && bemf > ref)
-				{
-					sw = 1;
-				}
-				if (sw)
-				{
-					static uint32_t last_det = 0;
-					commutator(comm_step, comm_duty);
-					++comm_step;
-					if (comm_step == 6) comm_step = 0;
-					trg_buf[trg_ndx] = DWT->CYCCNT;
-					if (trg_ndx >= TRG_BUF_SZ) trg_ndx = 0;
-					uint32_t dt = (trg_buf[trg_ndx] - last_det);
-					rpm_est = 60.0 / ( ((float)dt/CLK) * 6 * motor_pp );
-					last_det = trg_buf[trg_ndx];
-					++trg_ndx;
-				}
+				// run commutator
+				commutator(comm_step, comm_duty);
+				++comm_step;
+				if (comm_step == 6) comm_step = 0;
+
+				// log time, calculate RPM
+				uint32_t t = DWT->CYCCNT;
+				dt = (t - last_t);
+				ttf = LPF((float)dt, y1, ALFA_RPM, ALFA_RPM1);
+				y1 = ttf;
+
+				last_t = t;
+				trg_buf[trg_ndx] = dt;
+				++trg_ndx;
+				if (trg_ndx >= TRG_BUF_SZ) trg_ndx = 0;
         	}
         }
 
@@ -246,31 +259,32 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
         // This gets called when PA0 has an edge event
         // Your interrupt logic goes here
         HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);  // e.g., toggle an LED
-//    	++comm_step;
-//    	if (comm_step == 6) comm_step = 0;
-//    	commutator(comm_step, comm_duty);
-
+/*
+ * 0: 0.59
+ * 1: 0.67
+ * 2: 0.777
+ * 3: 1.0
+ */
         if (speed_ndx == 0)
-        {
-        	comm_duty = 5666 * 0.59;
+    	{
+        	comm_duty = 5666 * 0.67;
         	speed_ndx = 1;
         }
         else if (speed_ndx == 1)
-    	{
-        	comm_duty = 5666 * 0.67;
+        {
+        	comm_duty = 5666 * 0.777;
         	speed_ndx = 2;
         }
         else if (speed_ndx == 2)
         {
-        	comm_duty = 5666 * 0.8;
+        	comm_duty = 5666 * 1.0;
         	speed_ndx = 3;
         }
         else if (speed_ndx == 3)
-        {
-        	comm_duty = 5666 * 1.0;
-        	speed_ndx = 0;
-        }
-
+         {
+         	comm_duty = 5666 * 0.59;
+         	speed_ndx = 0;
+         }
 
     }
 }
@@ -355,20 +369,38 @@ void commutator(int step, uint16_t duty)
     HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_4);
     __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, per/2);
 
-
+#if defined(COMM_MODE_PWMLOW)
+    // Configure and enable SINK (low-side PWM) to be active (no PWM)
+    sConfig.OCMode = TIM_OCMODE_PWM1;
+    sConfig.Pulse = TIM1->ARR;  // max duty
+    HAL_TIM_PWM_ConfigChannel(&htim1, &sConfig, source);
+    HAL_TIM_PWM_Start(&htim1, source);
+    HAL_TIMEx_PWMN_Start(&htim1, source);
+#else // COMM_MODE_PWM_COMPLEMENTARY
     // Configure and enable SOURCE (high-side PWM)
     sConfig.OCMode = TIM_OCMODE_PWM1;
     sConfig.Pulse = duty;
     HAL_TIM_PWM_ConfigChannel(&htim1, &sConfig, source);
     HAL_TIM_PWM_Start(&htim1, source);
     HAL_TIMEx_PWMN_Start(&htim1, source);
+#endif
 
+#if defined(COMM_MODE_PWMHIGH)
+    // Configure and enable SINK (low-side PWM) to be active (no PWM)
+    sConfig.OCMode = TIM_OCMODE_PWM2;
+    sConfig.Pulse = TIM1->ARR;  // max duty
+    HAL_TIM_PWM_ConfigChannel(&htim1, &sConfig, sink);
+    HAL_TIM_PWM_Start(&htim1, sink);
+    HAL_TIMEx_PWMN_Start(&htim1, sink);
+#else // COMM_MODE_PWM_COMPLEMENTARY
     // Configure and enable SINK (low-side PWM)
     sConfig.OCMode = TIM_OCMODE_PWM2;
     sConfig.Pulse = duty;
     HAL_TIM_PWM_ConfigChannel(&htim1, &sConfig, sink);
     HAL_TIM_PWM_Start(&htim1, sink);
     HAL_TIMEx_PWMN_Start(&htim1, sink);
+#endif
+
 
     HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
 
@@ -467,10 +499,8 @@ int main(void)
 
   frq_commtask = frq_start;
   lim_commtask = MOD_FREQ / frq_commtask;
-
   // set ref channel for startup
   SetInjectedBEMFChannel(ADC_CHANNEL_14);
-  printf("state=%d, trig_measure=%d, RPM=%f, ref=%u \n", comm_state, trig_measure, rpm_est, ref);
 
   while (1)
   {
@@ -482,7 +512,7 @@ int main(void)
 		  if (comm_state == STATE_MEASURE)
 		  {
 			  // check measure trigger
-			  if (trig_measure == TRIG_PENDING)
+			  if (TRIGGER_STAT(trig_measure) == TRIG_PENDING)
 			  {
 				  float x=0;
 				  float one_over_sz = 1.0 / MEASURE_THRESH;
@@ -493,12 +523,10 @@ int main(void)
 				  }
 				  ref = (int)x / 2;
 
-				  trig_measure = TRIG_COMPLETE;
+				  TRIGGER_COMPLETE(trig_measure);
 				  // start spinup
 				  comm_state = STATE_SPINUP;
-
 				  printf("transitioning from measure to spinup, vref=%f x=%u \n", x, ref);
-
 
 			  }
 		  }
@@ -518,6 +546,12 @@ int main(void)
 				  }
 			  }
 		  }
+		  else if (comm_state == STATE_COMMUTATE)
+		  {
+			  // compute RPM
+			  rpm_est = 60.0 / ( (ttf/CLK) * 6 * motor_pp );
+		  }
+
 		  TASK_HANDLER_t0 = DWT->CYCCNT;
 	  }
 
@@ -526,7 +560,8 @@ int main(void)
 	  DIAG_HANDLER_EL = DWT->CYCCNT - DIAG_HANDLER_t0;
 	  if (DIAG_HANDLER_EL >= DIAG_HANDLER_LIM)
 	  {
-		  printf("state=%d, trig_measure=%d, RPM=%f, ref=%u \n", comm_state, trig_measure, rpm_est, ref);
+
+		  printf("state=%d, spd=%d, RPM=%.0f, ref=%u \n", comm_state, speed_ndx, rpm_est, ref);
 		  DIAG_HANDLER_t0 = DWT->CYCCNT;
 	  }
 
