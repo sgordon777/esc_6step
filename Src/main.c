@@ -56,9 +56,7 @@ TIM_HandleTypeDef htim1;
 // throttle
 //
 // TODO: fix RPM
-// TODO: x throttle
-// TODO: x Get trip point automatically (doesn't track voltage changes)
-// TODO: PWM+soid modulation
+// TODO: Analog throttle
 // TODO: try highres timer
 // TODO: lookup table for commutator step switchblock
 // TODO: rewrite time-critical bits in LL
@@ -90,23 +88,46 @@ int16_t adc_buf[ADC_BUF_SZ];
 uint32_t trg_buf[TRG_BUF_SZ];
 
 
-// param
-//#define COMM_MODE_PWM_COMPLEMENTARY
-//#define COMM_MODE_PWMHIGH
-#define COMM_MODE_PWMLOW
 
+// param
+
+// speed tables
+#define INIT_SPEED (0.64)
+float speed_vals[] = {0.55, 0.64, 0.77, 0.99};
+int NUM_SPEEDS = 4;
+int speed_ndx = 1; // 0=
+
+// commutation tables
+#if 1
+// canocial (ccw)
+uint32_t comm_source_chan[6] = 	{TIM_CHANNEL_1, TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_2, TIM_CHANNEL_3, TIM_CHANNEL_3};
+uint32_t comm_sink_chan[6] =   	{TIM_CHANNEL_2, TIM_CHANNEL_3, TIM_CHANNEL_3, TIM_CHANNEL_1, TIM_CHANNEL_1, TIM_CHANNEL_2};
+uint32_t comm_float_chan[6] =  	{TIM_CHANNEL_3, TIM_CHANNEL_2, TIM_CHANNEL_1, TIM_CHANNEL_3, TIM_CHANNEL_2, TIM_CHANNEL_1};
+uint32_t comm_adc_chan[6] = 	{ADC_CHANNEL_11, ADC_CHANNEL_2, ADC_CHANNEL_1, ADC_CHANNEL_11, ADC_CHANNEL_2, ADC_CHANNEL_1};
+uint32_t comm_zz_pol[6] =       {0, 1, 0, 1, 0, 1};
+#else
+// alternate (cw)
+uint32_t comm_source_chan[6] = 	{TIM_CHANNEL_1, TIM_CHANNEL_3, TIM_CHANNEL_3, TIM_CHANNEL_2, TIM_CHANNEL_2, TIM_CHANNEL_1};
+uint32_t comm_sink_chan[6] =   	{TIM_CHANNEL_2, TIM_CHANNEL_2, TIM_CHANNEL_1, TIM_CHANNEL_1, TIM_CHANNEL_3, TIM_CHANNEL_3};
+uint32_t comm_float_chan[6] =  	{TIM_CHANNEL_3, TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_3, TIM_CHANNEL_1, TIM_CHANNEL_2};
+uint32_t comm_adc_chan[6] = 	{ADC_CHANNEL_11, ADC_CHANNEL_1, ADC_CHANNEL_2, ADC_CHANNEL_11, ADC_CHANNEL_1, ADC_CHANNEL_2};
+uint32_t comm_zz_pol[6] =       {1, 0, 1, 0, 1, 0};
+#endif
+
+#define COMM_MODE_PWMCOMP
+//#define COMM_MODE_PWMHIGH
+//#define COMM_MODE_PWMLOW
 float frq_start = 10;  // hz
-float frq_stop = 500;  // hz
-float frq_inc = 500; // hz/sec
-uint16_t comm_duty = 5666 * 0.67 ; // out of TIM1->ARR
+float frq_stop = 1000;  // hz
+float frq_inc = 1000; // hz/sec
+uint16_t comm_duty = 5666 * INIT_SPEED ; // out of TIM1->ARR
 int hold_end_spinup = 0;
 int motor_pp = 7;
 float motor_res = 10;
 float motor_inductino = 1E-5;
 uint32_t dt = 1;
-float ALFA_RPM = 0.001;
-float ALFA_RPM1 = 0.999;
-
+float ALFA_RPM = 0.003;
+float ALFA_RPM1 = 0.997;
 
 
 // global
@@ -124,12 +145,17 @@ float rpm_est = 0;
 uint16_t ref;
 uint32_t trig_measure = 0;
 const uint32_t MEASURE_THRESH = ADC_BUF_SZ / 2;
-speed_ndx = 1; // 0=
 float ttf;
+uint32_t mod_tick = 0;
+uint32_t delta_mod = 0;
+uint32_t zc_sw = 0;
+uint32_t bemf_sw = 0;
+int32_t bemfdiff_sw = 0;
 
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
+void SetInjectedBEMFChannel(uint32_t adc_channel);
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DAC1_Init(void);
@@ -151,7 +177,6 @@ void ADC1_2_IRQHandler(void)
 }
 
 
-
 void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 {
 	static int ctr_commtask = 0;
@@ -163,7 +188,6 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 
         //bemf = (bemf_raw + last_bemf) / 2;
         bemf = bemf_raw;
-        last_bemf = bemf_raw;
 
         HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_14);  // e.g., toggle an LED
 
@@ -172,32 +196,27 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
         if (comm_state == STATE_MEASURE)
         {
         	// one-time state to measure ref voltage before motor running
-        	if (adc_ndx >= MEASURE_THRESH)
-        	{
-        		// schedule ref measurement
-        		TRIGGER_START(trig_measure);
-        	}
+        	if (adc_ndx >= MEASURE_THRESH) TRIGGER_START(trig_measure);   // schedule ref measurement
         }
-
         else if (comm_state == STATE_SPINUP)
         {
         	// manage spin-up state
 			if (ctr_commtask >= lim_commtask)
 			{
 				commutator(comm_step, comm_duty);
-				ctr_commtask = 0;
 				++comm_step;
 				if (comm_step == 6) comm_step = 0;
+				ctr_commtask = 0;
 			}
 			++ctr_commtask;
         }
         else if (comm_state == STATE_COMMUTATE)
         {
             // Manage commutating state: detect ZC and commutate
-			if (    (comm_stabilize_count > 4) &&
-					(zc_pol == 0 && bemf < ref) || (zc_pol == 1 && bemf > ref) )
+			if (    (comm_stabilize_count > 1) && ( (zc_pol == 0 && bemf < ref) || (zc_pol == 1 && bemf > ref) ) )
 			{
 				// zero cross detected. Commutate the motor.
+				static uint32_t last_tick = 0;
 				static uint32_t last_t = 0;
 				static float y1 = 0;
 
@@ -216,14 +235,78 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 				trg_buf[trg_ndx] = dt;
 				++trg_ndx;
 				if (trg_ndx >= TRG_BUF_SZ) trg_ndx = 0;
+
+				delta_mod = mod_tick - last_tick;
+				bemf_sw = bemf;
+				zc_sw = zc_pol;
+				bemfdiff_sw = (int32_t)bemf - (int32_t)last_bemf;
+				last_tick = mod_tick;
+		        HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_13	);  // e.g., toggle an LED
+
         	}
         }
 
         ++adc_ndx;
         if (adc_ndx >= ADC_BUF_SZ) adc_ndx = 0;
+        ++mod_tick;
         ++comm_stabilize_count;
+        last_bemf = bemf_raw;
 
     }
+}
+
+
+void commutator(int step, uint16_t duty)
+{
+	//printf("phs=%d, dut=%d\n", step, duty);
+    TIM_OC_InitTypeDef sConfig = {
+        .OCPolarity = TIM_OCPOLARITY_HIGH,
+        .OCNPolarity = TIM_OCNPOLARITY_HIGH,
+        .OCFastMode = TIM_OCFAST_DISABLE,
+        .OCIdleState = TIM_OCIDLESTATE_RESET,
+        .OCNIdleState = TIM_OCNIDLESTATE_RESET,
+    };
+
+    // Determine active channels
+    uint32_t source_ch = comm_source_chan[step];
+    uint32_t sink_ch = comm_sink_chan[step];
+    uint32_t float_ch = comm_float_chan[step];
+    uint32_t adc_ch = comm_adc_chan[step];
+    zc_pol = comm_zz_pol[step];
+
+	SetInjectedBEMFChannel(adc_ch);
+
+    HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1); HAL_TIMEx_PWMN_Stop(&htim1, TIM_CHANNEL_1); __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
+    HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_2); HAL_TIMEx_PWMN_Stop(&htim1, TIM_CHANNEL_2); __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 0);
+    HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_3); HAL_TIMEx_PWMN_Stop(&htim1, TIM_CHANNEL_3); __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 0);
+    HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_4);											 __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, per/2);
+
+// SOURCE SIDE
+    sConfig.OCMode = TIM_OCMODE_PWM1;
+#if defined(COMM_MODE_PWMLOW)
+    // Configure and enable SINK (low-side PWM) to be active (no PWM)
+    sConfig.Pulse = TIM1->ARR;  // max duty
+#else // COMM_MODE_PWMCOMP
+    // Configure and enable SOURCE (high-side PWM)
+    sConfig.Pulse = duty;
+#endif
+    HAL_TIM_PWM_ConfigChannel(&htim1, &sConfig, source_ch);
+    HAL_TIM_PWM_Start(&htim1, source_ch);
+    HAL_TIMEx_PWMN_Start(&htim1, source_ch);
+
+// SINK SIDE
+    sConfig.OCMode = TIM_OCMODE_PWM2;
+#if defined(COMM_MODE_PWMHIGH)
+    sConfig.Pulse = TIM1->ARR;  // max duty
+#else // COMM_MODE_PWMCOMP
+    sConfig.Pulse = duty;
+#endif
+    HAL_TIM_PWM_ConfigChannel(&htim1, &sConfig, sink_ch);
+    HAL_TIM_PWM_Start(&htim1, sink_ch);
+    HAL_TIMEx_PWMN_Start(&htim1, sink_ch);
+
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
+    comm_stabilize_count = 0;
 }
 
 void SetInjectedBEMFChannel(uint32_t adc_channel)
@@ -259,163 +342,13 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
         // This gets called when PA0 has an edge event
         // Your interrupt logic goes here
         HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);  // e.g., toggle an LED
-/*
- * 0: 0.59
- * 1: 0.67
- * 2: 0.777
- * 3: 1.0
- */
-        if (speed_ndx == 0)
-    	{
-        	comm_duty = 5666 * 0.67;
-        	speed_ndx = 1;
-        }
-        else if (speed_ndx == 1)
-        {
-        	comm_duty = 5666 * 0.777;
-        	speed_ndx = 2;
-        }
-        else if (speed_ndx == 2)
-        {
-        	comm_duty = 5666 * 1.0;
-        	speed_ndx = 3;
-        }
-        else if (speed_ndx == 3)
-         {
-         	comm_duty = 5666 * 0.59;
-         	speed_ndx = 0;
-         }
+
+        speed_ndx += 1;
+        if (speed_ndx >= NUM_SPEEDS)
+			speed_ndx = 0;
+        comm_duty = 5666 * speed_vals[speed_ndx];
 
     }
-}
-
-void commutator(int step, uint16_t duty)
-{
-
-	//printf("phs=%d, dut=%d\n", step, duty);
-
-    TIM_OC_InitTypeDef sConfig = {
-        .OCPolarity = TIM_OCPOLARITY_HIGH,
-        .OCNPolarity = TIM_OCNPOLARITY_HIGH,
-        .OCFastMode = TIM_OCFAST_DISABLE,
-        .OCIdleState = TIM_OCIDLESTATE_RESET,
-        .OCNIdleState = TIM_OCNIDLESTATE_RESET,
-    };
-
-    // Determine active channels
-    uint32_t source = 0, sink = 0, float_channel=0, adc_float_channel=0 ;
-
-    switch (step)
-    {
-        case 0:
-        	source = TIM_CHANNEL_1;
-        	sink = TIM_CHANNEL_2;
-        	float_channel = TIM_CHANNEL_3;
-        	adc_float_channel = ADC_CHANNEL_11;
-        	switched = 1;
-        	zc_pol = 0;
-        	break;
-        case 1:
-        	source = TIM_CHANNEL_1;
-        	sink = TIM_CHANNEL_3;
-        	float_channel = TIM_CHANNEL_2;
-        	adc_float_channel = ADC_CHANNEL_2;
-        	zc_pol = 1;
-        	break;
-        case 2:
-        	source = TIM_CHANNEL_2;
-        	sink = TIM_CHANNEL_3;
-        	float_channel = TIM_CHANNEL_1;
-        	adc_float_channel = ADC_CHANNEL_1;
-        	zc_pol = 0;
-        	break;
-        case 3:
-        	source = TIM_CHANNEL_2;
-        	sink = TIM_CHANNEL_1;
-        	float_channel = TIM_CHANNEL_3;
-        	adc_float_channel = ADC_CHANNEL_11;
-        	zc_pol = 1;
-        	break;
-        case 4:
-        	source = TIM_CHANNEL_3;
-        	sink = TIM_CHANNEL_1;
-        	float_channel = TIM_CHANNEL_2;
-        	adc_float_channel = ADC_CHANNEL_2;
-        	zc_pol = 0;
-        	break;
-        case 5:
-        	source = TIM_CHANNEL_3;
-        	sink = TIM_CHANNEL_2;
-        	float_channel = TIM_CHANNEL_1;
-        	adc_float_channel = ADC_CHANNEL_1;
-        	zc_pol = 1;
-        	break;
-    }
-
-	SetInjectedBEMFChannel(adc_float_channel);
-
-    // Stop all outputs first
-    for (int ch = 1; ch <= 3; ++ch) {
-        uint32_t chx = (ch == 1) ? TIM_CHANNEL_1 :
-                       (ch == 2) ? TIM_CHANNEL_2 :
-                                   TIM_CHANNEL_3;
-
-        HAL_TIM_PWM_Stop(&htim1, chx);
-        HAL_TIMEx_PWMN_Stop(&htim1, chx);
-        __HAL_TIM_SET_COMPARE(&htim1, chx, 0);
-    }
-
-    // channel4 triggers the ADC. Set it to per/2 so ADC is triggered at center of PWM cycle
-    HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_4);
-    __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, per/2);
-
-#if defined(COMM_MODE_PWMLOW)
-    // Configure and enable SINK (low-side PWM) to be active (no PWM)
-    sConfig.OCMode = TIM_OCMODE_PWM1;
-    sConfig.Pulse = TIM1->ARR;  // max duty
-    HAL_TIM_PWM_ConfigChannel(&htim1, &sConfig, source);
-    HAL_TIM_PWM_Start(&htim1, source);
-    HAL_TIMEx_PWMN_Start(&htim1, source);
-#else // COMM_MODE_PWM_COMPLEMENTARY
-    // Configure and enable SOURCE (high-side PWM)
-    sConfig.OCMode = TIM_OCMODE_PWM1;
-    sConfig.Pulse = duty;
-    HAL_TIM_PWM_ConfigChannel(&htim1, &sConfig, source);
-    HAL_TIM_PWM_Start(&htim1, source);
-    HAL_TIMEx_PWMN_Start(&htim1, source);
-#endif
-
-#if defined(COMM_MODE_PWMHIGH)
-    // Configure and enable SINK (low-side PWM) to be active (no PWM)
-    sConfig.OCMode = TIM_OCMODE_PWM2;
-    sConfig.Pulse = TIM1->ARR;  // max duty
-    HAL_TIM_PWM_ConfigChannel(&htim1, &sConfig, sink);
-    HAL_TIM_PWM_Start(&htim1, sink);
-    HAL_TIMEx_PWMN_Start(&htim1, sink);
-#else // COMM_MODE_PWM_COMPLEMENTARY
-    // Configure and enable SINK (low-side PWM)
-    sConfig.OCMode = TIM_OCMODE_PWM2;
-    sConfig.Pulse = duty;
-    HAL_TIM_PWM_ConfigChannel(&htim1, &sConfig, sink);
-    HAL_TIM_PWM_Start(&htim1, sink);
-    HAL_TIMEx_PWMN_Start(&htim1, sink);
-#endif
-
-
-    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
-
-
-    // Configure and enable SINK (low-side PWM)
-    //sConfig.OCMode = TIM_OCMODE_FORCED_INACTIVE;
-    //sConfig.Pulse = 0;
-    //HAL_TIM_PWM_ConfigChannel(&htim1, &sConfig, float_channel);
-    //HAL_TIM_PWM_Start(&htim1, float_channel);
-    //HAL_TIMEx_PWMN_Start(&htim1, float_channel);
-
-
-    // FLOATING PHASE: leave disabled (already done in the for-loop)
-    // optionally, set that phase's pins to analog mode or GPIO hi-Z if needed
-    comm_stabilize_count = 0;
 }
 
 
@@ -561,7 +494,8 @@ int main(void)
 	  if (DIAG_HANDLER_EL >= DIAG_HANDLER_LIM)
 	  {
 
-		  printf("state=%d, spd=%d, RPM=%.0f, ref=%u \n", comm_state, speed_ndx, rpm_est, ref);
+		  printf("state=%d, spd=%d, RPM=%.0f, ref=%u, com_delt=%.1f, com_deltk=%u com_bemfsw=%u, com_bemfdiff=%d, sw_zc=%u\n",
+				  comm_state, speed_ndx, rpm_est, ref, ttf, delta_mod, bemf_sw, bemfdiff_sw, zc_sw);
 		  DIAG_HANDLER_t0 = DWT->CYCCNT;
 	  }
 
