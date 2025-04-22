@@ -55,7 +55,11 @@ TIM_HandleTypeDef htim1;
 /* USER CODE BEGIN PV */
 // throttle
 //
-// TODO: fix RPM
+// BUG: low RPM has weird backward-looking phases, cannot commutate correctly
+// BUG: Blown cycle budget on commutating
+// TODO: fix RPM (variable frequency)
+// TODO: try 60K
+// TODO: fit PWMHIGH mode
 // TODO: Analog throttle
 // TODO: try highres timer
 // TODO: lookup table for commutator step switchblock
@@ -79,10 +83,7 @@ const int STATE_COMMUTATE = 2;
 #define TRIGGER_COMPLETE(x) (x = (x==TRIG_PENDING) ? TRIG_COMPLETE : x )
 #define TRIGGER_RESET(x)    (x = TRIG_IDLE)
 #define TRIGGER_STAT(x) (x)
-const float CLK = 170E6;
-const int MOD_FREQ = 30000;
-uint16_t per = (int)( CLK / MOD_FREQ );
-int max_dut = 5666;
+const float CPU_CLK = 170E6;
 void commutator(int step, uint16_t duty_cycle_ticks);
 int16_t adc_buf[ADC_BUF_SZ];
 uint32_t trg_buf[TRG_BUF_SZ];
@@ -90,10 +91,11 @@ uint32_t trg_buf[TRG_BUF_SZ];
 
 
 // param
-
+const int MOD_FREQ = 30000;
+uint16_t per = (int)( CPU_CLK / (2*MOD_FREQ) );
 // speed tables
-#define INIT_SPEED (0.64)
-float speed_vals[] = {0.55, 0.64, 0.77, 0.99};
+#define INIT_SPEED (0.65)
+float speed_vals[] = {0.60, 0.65, 0.77, 0.99};
 int NUM_SPEEDS = 4;
 int speed_ndx = 1; // 0=
 
@@ -118,9 +120,8 @@ uint32_t comm_zz_pol[6] =       {1, 0, 1, 0, 1, 0};
 //#define COMM_MODE_PWMHIGH
 //#define COMM_MODE_PWMLOW
 float frq_start = 10;  // hz
-float frq_stop = 1000;  // hz
-float frq_inc = 1000; // hz/sec
-uint16_t comm_duty = 5666 * INIT_SPEED ; // out of TIM1->ARR
+float frq_stop = 300;  // hz
+float frq_inc = 200; // hz/sec
 int hold_end_spinup = 0;
 int motor_pp = 7;
 float motor_res = 10;
@@ -151,6 +152,8 @@ uint32_t delta_mod = 0;
 uint32_t zc_sw = 0;
 uint32_t bemf_sw = 0;
 int32_t bemfdiff_sw = 0;
+uint32_t comm_duty;
+
 
 /* USER CODE END PV */
 
@@ -183,13 +186,14 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 
 	if (hadc->Instance == ADC1)
     {
+HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
 		static uint16_t last_bemf = 0, bemf = 0;
         uint16_t bemf_raw = HAL_ADCEx_InjectedGetValue(hadc, ADC_INJECTED_RANK_1);
 
         //bemf = (bemf_raw + last_bemf) / 2;
         bemf = bemf_raw;
 
-        HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_14);  // e.g., toggle an LED
+
 
         adc_buf[adc_ndx] = bemf;
 
@@ -213,14 +217,14 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
         else if (comm_state == STATE_COMMUTATE)
         {
             // Manage commutating state: detect ZC and commutate
-			if (    (comm_stabilize_count > 1) && ( (zc_pol == 0 && bemf < ref) || (zc_pol == 1 && bemf > ref) ) )
+			if (    (comm_stabilize_count > 2) && ( (zc_pol == 0 && bemf < ref) || (zc_pol == 1 && bemf > ref) ) )
 			{
 				// zero cross detected. Commutate the motor.
 				static uint32_t last_tick = 0;
 				static uint32_t last_t = 0;
 				static float y1 = 0;
 
-				// run commutator
+HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET);				// run commutator
 				commutator(comm_step, comm_duty);
 				++comm_step;
 				if (comm_step == 6) comm_step = 0;
@@ -241,7 +245,7 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
 				zc_sw = zc_pol;
 				bemfdiff_sw = (int32_t)bemf - (int32_t)last_bemf;
 				last_tick = mod_tick;
-		        HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_13	);  // e.g., toggle an LED
+HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET);				// run commutator
 
         	}
         }
@@ -251,6 +255,7 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
         ++mod_tick;
         ++comm_stabilize_count;
         last_bemf = bemf_raw;
+HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
 
     }
 }
@@ -346,7 +351,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
         speed_ndx += 1;
         if (speed_ndx >= NUM_SPEEDS)
 			speed_ndx = 0;
-        comm_duty = 5666 * speed_vals[speed_ndx];
+        comm_duty = per * speed_vals[speed_ndx];
 
     }
 }
@@ -411,6 +416,9 @@ int main(void)
   // enable
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_3, GPIO_PIN_SET);
 
+  comm_duty = per * INIT_SPEED ; // out of TIM1->ARR
+
+
   commutator(comm_step, comm_duty);
   CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
   DWT->CYCCNT = 0;
@@ -422,11 +430,11 @@ int main(void)
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 
-  uint32_t TASK_HANDLER_LIM = CLK / 100;
+  uint32_t TASK_HANDLER_LIM = CPU_CLK / 100;
   uint32_t TASK_HANDLER_EL ;
   uint32_t TASK_HANDLER_t0 = DWT->CYCCNT ;
 
-  uint32_t DIAG_HANDLER_LIM = CLK / 1;
+  uint32_t DIAG_HANDLER_LIM = CPU_CLK / 1;
   uint32_t DIAG_HANDLER_EL ;
   uint32_t DIAG_HANDLER_t0 = DWT->CYCCNT ;
 
@@ -482,7 +490,7 @@ int main(void)
 		  else if (comm_state == STATE_COMMUTATE)
 		  {
 			  // compute RPM
-			  rpm_est = 60.0 / ( (ttf/CLK) * 6 * motor_pp );
+			  rpm_est = 60.0 / ( (ttf/CPU_CLK) * 6 * motor_pp );
 		  }
 
 		  TASK_HANDLER_t0 = DWT->CYCCNT;
@@ -493,9 +501,9 @@ int main(void)
 	  DIAG_HANDLER_EL = DWT->CYCCNT - DIAG_HANDLER_t0;
 	  if (DIAG_HANDLER_EL >= DIAG_HANDLER_LIM)
 	  {
-
-		  printf("state=%d, spd=%d, RPM=%.0f, ref=%u, com_delt=%.1f, com_deltk=%u com_bemfsw=%u, com_bemfdiff=%d, sw_zc=%u\n",
-				  comm_state, speed_ndx, rpm_est, ref, ttf, delta_mod, bemf_sw, bemfdiff_sw, zc_sw);
+		  uint32_t maxk = (uint32_t)( (ttf / CPU_CLK) * MOD_FREQ );
+		  printf("state=%d, spd=%d, RPM=%.0f, ref=%u, com_delt=%.1f, com_deltk=[%u/%u] com_bemfsw=%u, com_bemfdiff=%d, sw_zc=%u\n",
+				  comm_state, speed_ndx, rpm_est, ref, ttf, delta_mod, maxk, bemf_sw, bemfdiff_sw, zc_sw);
 		  DIAG_HANDLER_t0 = DWT->CYCCNT;
 	  }
 
