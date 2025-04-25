@@ -51,12 +51,14 @@ DAC_HandleTypeDef hdac1;
 UART_HandleTypeDef hlpuart1;
 
 TIM_HandleTypeDef htim1;
+TIM_HandleTypeDef htim2;
 
 /* USER CODE BEGIN PV */
 // throttle
 //
 // BUG: low RPM has weird backward-looking phases, cannot commutate correctly
 // BUG: Blown cycle budget on commutating
+// BUG: new pinout affects performance: an ADC pin is adjacent to a timer pin
 // TODO: fix RPM (variable frequency)
 // TODO: try 60K
 // TODO: fit PWMHIGH mode
@@ -94,10 +96,9 @@ uint32_t trg_buf[TRG_BUF_SZ];
 const int MOD_FREQ = 30000;
 uint16_t per = (int)( CPU_CLK / (2*MOD_FREQ) );
 // speed tables
-#define INIT_SPEED (0.65)
-float speed_vals[] = {0.60, 0.65, 0.77, 0.99};
-int NUM_SPEEDS = 4;
-int speed_ndx = 1; // 0=
+float speed_vals[] = {0.57, 0.75, 0.77, 0.99};
+int NUM_SPEEDS = sizeof(speed_vals) >> 2;
+int speed_ndx = 0; // 0=
 
 // commutation tables
 #if 1
@@ -105,14 +106,14 @@ int speed_ndx = 1; // 0=
 uint32_t comm_source_chan[6] = 	{TIM_CHANNEL_1, TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_2, TIM_CHANNEL_3, TIM_CHANNEL_3};
 uint32_t comm_sink_chan[6] =   	{TIM_CHANNEL_2, TIM_CHANNEL_3, TIM_CHANNEL_3, TIM_CHANNEL_1, TIM_CHANNEL_1, TIM_CHANNEL_2};
 uint32_t comm_float_chan[6] =  	{TIM_CHANNEL_3, TIM_CHANNEL_2, TIM_CHANNEL_1, TIM_CHANNEL_3, TIM_CHANNEL_2, TIM_CHANNEL_1};
-uint32_t comm_adc_chan[6] = 	{ADC_CHANNEL_11, ADC_CHANNEL_2, ADC_CHANNEL_1, ADC_CHANNEL_11, ADC_CHANNEL_2, ADC_CHANNEL_1};
+uint32_t comm_adc_chan[6] = 	{ADC_CHANNEL_11, ADC_CHANNEL_12, ADC_CHANNEL_1, ADC_CHANNEL_11, ADC_CHANNEL_12, ADC_CHANNEL_1};
 uint32_t comm_zz_pol[6] =       {0, 1, 0, 1, 0, 1};
 #else
 // alternate (cw)
 uint32_t comm_source_chan[6] = 	{TIM_CHANNEL_1, TIM_CHANNEL_3, TIM_CHANNEL_3, TIM_CHANNEL_2, TIM_CHANNEL_2, TIM_CHANNEL_1};
 uint32_t comm_sink_chan[6] =   	{TIM_CHANNEL_2, TIM_CHANNEL_2, TIM_CHANNEL_1, TIM_CHANNEL_1, TIM_CHANNEL_3, TIM_CHANNEL_3};
 uint32_t comm_float_chan[6] =  	{TIM_CHANNEL_3, TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_3, TIM_CHANNEL_1, TIM_CHANNEL_2};
-uint32_t comm_adc_chan[6] = 	{ADC_CHANNEL_11, ADC_CHANNEL_1, ADC_CHANNEL_2, ADC_CHANNEL_11, ADC_CHANNEL_1, ADC_CHANNEL_2};
+uint32_t comm_adc_chan[6] = 	{ADC_CHANNEL_11, ADC_CHANNEL_1, ADC_CHANNEL_12, ADC_CHANNEL_11, ADC_CHANNEL_1, ADC_CHANNEL_12};
 uint32_t comm_zz_pol[6] =       {1, 0, 1, 0, 1, 0};
 #endif
 
@@ -121,7 +122,7 @@ uint32_t comm_zz_pol[6] =       {1, 0, 1, 0, 1, 0};
 //#define COMM_MODE_PWMLOW
 float frq_start = 10;  // hz
 float frq_stop = 300;  // hz
-float frq_inc = 200; // hz/sec
+float frq_inc = 300; // hz/sec
 int hold_end_spinup = 0;
 int motor_pp = 7;
 float motor_res = 10;
@@ -158,13 +159,13 @@ uint32_t comm_duty;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
-void SetInjectedBEMFChannel(uint32_t adc_channel);
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_DAC1_Init(void);
 static void MX_LPUART1_UART_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_ADC1_Init(void);
+static void MX_TIM2_Init(void);
 /* USER CODE BEGIN PFP */
 #define PUTCHAR_PROTOTYPE int __io_putchar(int ch)
 
@@ -286,30 +287,27 @@ void commutator(int step, uint16_t duty)
     HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_3); HAL_TIMEx_PWMN_Stop(&htim1, TIM_CHANNEL_3); __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 0);
     HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_4);											 __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, per/2);
 
-// SOURCE SIDE
-    sConfig.OCMode = TIM_OCMODE_PWM1;
-#if defined(COMM_MODE_PWMLOW)
-    // Configure and enable SINK (low-side PWM) to be active (no PWM)
-    sConfig.Pulse = TIM1->ARR;  // max duty
-#else // COMM_MODE_PWMCOMP
-    // Configure and enable SOURCE (high-side PWM)
     sConfig.Pulse = duty;
+
+// SOURCE SIDE
+#if defined(COMM_MODE_PWMLOW)
+    sConfig.OCMode = TIM_OCMODE_FORCED_ACTIVE;
+#else // COMM_MODE_PWMCOMP
+    sConfig.OCMode = TIM_OCMODE_PWM1;
 #endif
     HAL_TIM_PWM_ConfigChannel(&htim1, &sConfig, source_ch);
     HAL_TIM_PWM_Start(&htim1, source_ch);
     HAL_TIMEx_PWMN_Start(&htim1, source_ch);
 
 // SINK SIDE
-    sConfig.OCMode = TIM_OCMODE_PWM2;
 #if defined(COMM_MODE_PWMHIGH)
-    sConfig.Pulse = TIM1->ARR;  // max duty
-#else // COMM_MODE_PWMCOMP
-    sConfig.Pulse = duty;
+    sConfig.OCMode = TIM_OCMODE_FORCED_INACTIVE;
+#else
+    sConfig.OCMode = TIM_OCMODE_PWM2;
 #endif
     HAL_TIM_PWM_ConfigChannel(&htim1, &sConfig, sink_ch);
     HAL_TIM_PWM_Start(&htim1, sink_ch);
     HAL_TIMEx_PWMN_Start(&htim1, sink_ch);
-
     HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
     comm_stabilize_count = 0;
 }
@@ -338,7 +336,8 @@ void SetInjectedBEMFChannel(uint32_t adc_channel)
 
 void EXTI15_10_IRQHandler(void)
 {
-    HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_13);
+    HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_13 );
+    HAL_GPIO_EXTI_IRQHandler(GPIO_PIN_12 );
 }
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
@@ -346,7 +345,6 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     {
         // This gets called when PA0 has an edge event
         // Your interrupt logic goes here
-        HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);  // e.g., toggle an LED
 
         speed_ndx += 1;
         if (speed_ndx >= NUM_SPEEDS)
@@ -354,6 +352,13 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
         comm_duty = per * speed_vals[speed_ndx];
 
     }
+    else if (GPIO_Pin == GPIO_PIN_12)
+    {
+        HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);  // e.g., toggle an LED
+
+    }
+
+
 }
 
 
@@ -396,6 +401,7 @@ int main(void)
   MX_LPUART1_UART_Init();
   MX_TIM1_Init();
   MX_ADC1_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
 
 
@@ -416,7 +422,7 @@ int main(void)
   // enable
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_3, GPIO_PIN_SET);
 
-  comm_duty = per * INIT_SPEED ; // out of TIM1->ARR
+  comm_duty = per * speed_vals[speed_ndx] ; // out of TIM1->ARR
 
 
   commutator(comm_step, comm_duty);
@@ -442,6 +448,10 @@ int main(void)
   lim_commtask = MOD_FREQ / frq_commtask;
   // set ref channel for startup
   SetInjectedBEMFChannel(ADC_CHANNEL_14);
+
+  // start counting
+  HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL);
+
 
   while (1)
   {
@@ -499,11 +509,15 @@ int main(void)
 
 	  // spinup handler
 	  DIAG_HANDLER_EL = DWT->CYCCNT - DIAG_HANDLER_t0;
+
+
+	  uint32_t encpos = __HAL_TIM_GET_COUNTER(&htim2);
+
 	  if (DIAG_HANDLER_EL >= DIAG_HANDLER_LIM)
 	  {
 		  uint32_t maxk = (uint32_t)( (ttf / CPU_CLK) * MOD_FREQ );
-		  printf("state=%d, spd=%d, RPM=%.0f, ref=%u, com_delt=%.1f, com_deltk=[%u/%u] com_bemfsw=%u, com_bemfdiff=%d, sw_zc=%u\n",
-				  comm_state, speed_ndx, rpm_est, ref, ttf, delta_mod, maxk, bemf_sw, bemfdiff_sw, zc_sw);
+		  printf("state=%d, spd=%d, RPM=%.0f, ref=%u, com_delt=%.1f, com_deltk=[%u/%u] com_bemfsw=%u, com_bemfdiff=%d, sw_zc=%u, qenc=%u\n",
+				  comm_state, speed_ndx, rpm_est, ref, ttf, delta_mod, maxk, bemf_sw, bemfdiff_sw, zc_sw, encpos);
 		  DIAG_HANDLER_t0 = DWT->CYCCNT;
 	  }
 
@@ -699,7 +713,7 @@ static void MX_LPUART1_UART_Init(void)
 
   /* USER CODE END LPUART1_Init 1 */
   hlpuart1.Instance = LPUART1;
-  hlpuart1.Init.BaudRate = 115200;
+  hlpuart1.Init.BaudRate = 921600;
   hlpuart1.Init.WordLength = UART_WORDLENGTH_8B;
   hlpuart1.Init.StopBits = UART_STOPBITS_1;
   hlpuart1.Init.Parity = UART_PARITY_NONE;
@@ -822,6 +836,55 @@ static void MX_TIM1_Init(void)
 }
 
 /**
+  * @brief TIM2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM2_Init(void)
+{
+
+  /* USER CODE BEGIN TIM2_Init 0 */
+
+  /* USER CODE END TIM2_Init 0 */
+
+  TIM_Encoder_InitTypeDef sConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM2_Init 1 */
+
+  /* USER CODE END TIM2_Init 1 */
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = 0;
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = 2000000000;
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  sConfig.EncoderMode = TIM_ENCODERMODE_TI1;
+  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC1Filter = 0;
+  sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
+  sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
+  sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
+  sConfig.IC2Filter = 0;
+  if (HAL_TIM_Encoder_Init(&htim2, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM2_Init 2 */
+
+  /* USER CODE END TIM2_Init 2 */
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -847,11 +910,11 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13|GPIO_PIN_14, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin : B1_Pin */
-  GPIO_InitStruct.Pin = B1_Pin;
+  /*Configure GPIO pins : B1_Pin PC12 */
+  GPIO_InitStruct.Pin = B1_Pin|GPIO_PIN_12;
   GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
   /*Configure GPIO pin : PC3 */
   GPIO_InitStruct.Pin = GPIO_PIN_3;
