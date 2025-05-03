@@ -22,6 +22,8 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 
+#include "spiflash.h"
+#include "trace_spiflash.h"
 #include <stdio.h>
 /* USER CODE END Includes */
 
@@ -50,6 +52,10 @@ DAC_HandleTypeDef hdac1;
 
 UART_HandleTypeDef hlpuart1;
 
+SPI_HandleTypeDef hspi3;
+DMA_HandleTypeDef hdma_spi3_rx;
+DMA_HandleTypeDef hdma_spi3_tx;
+
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim2;
 
@@ -58,8 +64,9 @@ TIM_HandleTypeDef htim2;
 //
 // BUG: low RPM has weird backward-looking phases, cannot commutate correctly
 // BUG: Blown cycle budget on commutating
-// BUG: new pinout affects performance: an ADC pin is adjacent to a timer pin
-// TODO: fix RPM (variable frequency)
+// BUG: new pinout (driven by adding TIM2	) affects performance: an ADC pin is adjacent to a timer pin
+// BUG: COMM_MODE_PWMHIGH and COMM_MODE_PWMLOW dont work as well as should
+// BUG: RPM filter assumes a fixed sample rate but its not
 // TODO: try 60K
 // TODO: fit PWMHIGH mode
 // TODO: Analog throttle
@@ -68,7 +75,10 @@ TIM_HandleTypeDef htim2;
 // TODO: rewrite time-critical bits in LL
 // TODO: Make time ch4 handling a one-time, remove from commutation func
 // TODO: Macros for trigger, tasks
-
+//
+// encpos[4], cputime[4], adcval[2], commstate[2], 			comm_stabilize_count[4]
+// shaftpos	  time, 	  adc		 commutator angle		how long since zc_det
+//
 
 #define ADC_BUF_SZ (2048)
 #define TRG_BUF_SZ (2048)
@@ -96,7 +106,7 @@ uint32_t trg_buf[TRG_BUF_SZ];
 const int MOD_FREQ = 30000;
 uint16_t per = (int)( CPU_CLK / (2*MOD_FREQ) );
 // speed tables
-float speed_vals[] = {0.57, 0.75, 0.77, 0.99};
+float speed_vals[] = {0.60, 0.70, 0.87, 0.99};
 int NUM_SPEEDS = sizeof(speed_vals) >> 2;
 int speed_ndx = 0; // 0=
 
@@ -155,17 +165,18 @@ uint32_t bemf_sw = 0;
 int32_t bemfdiff_sw = 0;
 uint32_t comm_duty;
 
-
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_DAC1_Init(void);
 static void MX_LPUART1_UART_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_TIM2_Init(void);
+static void MX_SPI3_Init(void);
 /* USER CODE BEGIN PFP */
 #define PUTCHAR_PROTOTYPE int __io_putchar(int ch)
 
@@ -193,8 +204,6 @@ HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
 
         //bemf = (bemf_raw + last_bemf) / 2;
         bemf = bemf_raw;
-
-
 
         adc_buf[adc_ndx] = bemf;
 
@@ -397,11 +406,13 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_DAC1_Init();
   MX_LPUART1_UART_Init();
   MX_TIM1_Init();
   MX_ADC1_Init();
   MX_TIM2_Init();
+  MX_SPI3_Init();
   /* USER CODE BEGIN 2 */
 
 
@@ -453,9 +464,10 @@ int main(void)
   HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL);
 
 
+//  spi_test(&hspi3);
+
   while (1)
   {
-
 	  // spinup handler
 	  TASK_HANDLER_EL = DWT->CYCCNT - TASK_HANDLER_t0;
 	  if (TASK_HANDLER_EL >= TASK_HANDLER_LIM)
@@ -745,6 +757,46 @@ static void MX_LPUART1_UART_Init(void)
 }
 
 /**
+  * @brief SPI3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_SPI3_Init(void)
+{
+
+  /* USER CODE BEGIN SPI3_Init 0 */
+
+  /* USER CODE END SPI3_Init 0 */
+
+  /* USER CODE BEGIN SPI3_Init 1 */
+
+  /* USER CODE END SPI3_Init 1 */
+  /* SPI3 parameter configuration*/
+  hspi3.Instance = SPI3;
+  hspi3.Init.Mode = SPI_MODE_MASTER;
+  hspi3.Init.Direction = SPI_DIRECTION_2LINES;
+  hspi3.Init.DataSize = SPI_DATASIZE_8BIT;
+  hspi3.Init.CLKPolarity = SPI_POLARITY_LOW;
+  hspi3.Init.CLKPhase = SPI_PHASE_1EDGE;
+  hspi3.Init.NSS = SPI_NSS_SOFT;
+  hspi3.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;
+  hspi3.Init.FirstBit = SPI_FIRSTBIT_MSB;
+  hspi3.Init.TIMode = SPI_TIMODE_DISABLE;
+  hspi3.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+  hspi3.Init.CRCPolynomial = 7;
+  hspi3.Init.CRCLength = SPI_CRC_LENGTH_DATASIZE;
+  hspi3.Init.NSSPMode = SPI_NSS_PULSE_ENABLE;
+  if (HAL_SPI_Init(&hspi3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN SPI3_Init 2 */
+
+  /* USER CODE END SPI3_Init 2 */
+
+}
+
+/**
   * @brief TIM1 Initialization Function
   * @param None
   * @retval None
@@ -856,7 +908,7 @@ static void MX_TIM2_Init(void)
   htim2.Instance = TIM2;
   htim2.Init.Prescaler = 0;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 2000000000;
+  htim2.Init.Period = 4.294967295E9;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   sConfig.EncoderMode = TIM_ENCODERMODE_TI1;
@@ -885,6 +937,26 @@ static void MX_TIM2_Init(void)
 }
 
 /**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMAMUX1_CLK_ENABLE();
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Channel1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+  /* DMA1_Channel2_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel2_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel2_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -908,7 +980,7 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13|GPIO_PIN_14, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_4, GPIO_PIN_RESET);
 
   /*Configure GPIO pins : B1_Pin PC12 */
   GPIO_InitStruct.Pin = B1_Pin|GPIO_PIN_12;
@@ -930,8 +1002,8 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : PB13 PB14 */
-  GPIO_InitStruct.Pin = GPIO_PIN_13|GPIO_PIN_14;
+  /*Configure GPIO pins : PB13 PB14 PB4 */
+  GPIO_InitStruct.Pin = GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_4;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -951,7 +1023,6 @@ PUTCHAR_PROTOTYPE
 
   return ch;
 }
-
 
 
 /* USER CODE END 4 */
