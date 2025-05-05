@@ -96,7 +96,7 @@ const int STATE_COMMUTATE = 2;
 #define TRIGGER_RESET(x)    (x = TRIG_IDLE)
 #define TRIGGER_STAT(x) (x)
 const float CPU_CLK = 170E6;
-void commutator(int step, uint16_t duty_cycle_ticks);
+void commutator(uint8_t step, uint16_t duty_cycle_ticks);
 int16_t adc_buf[ADC_BUF_SZ];
 uint32_t trg_buf[TRG_BUF_SZ];
 
@@ -145,11 +145,11 @@ float ALFA_RPM1 = 0.997;
 // global
 int adc_ndx = 0;
 int trg_ndx = 0;
-int comm_step = 0;
+uint8_t comm_step = 0;
 int enable = 0;
 float frq_commtask = 10;
 int lim_commtask = 3000;  // MOD_FREQ / comm_freq
-int comm_state = STATE_MEASURE; // 0 = measure, 1=windup, 2=commmutation
+uint8_t comm_state = STATE_MEASURE; // 0 = measure, 1=windup, 2=commmutation
 int zc_pol = 0;
 int switched  = 0;
 int comm_stabilize_count = 0;
@@ -164,6 +164,29 @@ uint32_t zc_sw = 0;
 uint32_t bemf_sw = 0;
 int32_t bemfdiff_sw = 0;
 uint32_t comm_duty;
+uint16_t encpos_g = 0;
+uint16_t bemf_raw = 0;
+
+
+// 1 block = 256 bytes
+#define TRACEBUF_SZ_B (2048)
+#define TRACE_LEN_B (32768 * 6)
+uint8_t trace_buf[TRACEBUF_SZ_B];
+
+trace_object_t traceobj = {
+		.buffer_start = trace_buf,
+		.buffer_len_b = TRACEBUF_SZ_B,
+		.trace_record_len_b = 6,
+		.trace_len_b = TRACE_LEN_B,
+		.flash_len_b = 1024*1024*16,
+		.tracevals = {
+		{&encpos_g, 2},
+		{&bemf_raw, 2},
+		{&comm_state,1},
+		{&comm_step, 1}
+		}
+};
+
 
 /* USER CODE END PV */
 
@@ -200,7 +223,7 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
     {
 HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
 		static uint16_t last_bemf = 0, bemf = 0;
-        uint16_t bemf_raw = HAL_ADCEx_InjectedGetValue(hadc, ADC_INJECTED_RANK_1);
+        bemf_raw = HAL_ADCEx_InjectedGetValue(hadc, ADC_INJECTED_RANK_1);
 
         //bemf = (bemf_raw + last_bemf) / 2;
         bemf = bemf_raw;
@@ -271,7 +294,7 @@ HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
 }
 
 
-void commutator(int step, uint16_t duty)
+void commutator(uint8_t step, uint16_t duty)
 {
 	//printf("phs=%d, dut=%d\n", step, duty);
     TIM_OC_InitTypeDef sConfig = {
@@ -459,9 +482,16 @@ int main(void)
   lim_commtask = MOD_FREQ / frq_commtask;
   // set ref channel for startup
   SetInjectedBEMFChannel(ADC_CHANNEL_14);
-
   // start counting
   HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL);
+
+
+  printf("\n\n\nstarting\n\n\n");
+
+  HAL_Delay(2000);
+
+
+  trace_init(&traceobj, sizeof(traceobj), &hspi3);
 
 
 //  spi_test(&hspi3);

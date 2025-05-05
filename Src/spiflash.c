@@ -1,5 +1,9 @@
 
 #include "spiflash.h"
+#include <stdio.h>
+
+static uint32_t flash_wait_for_ready(SPI_HandleTypeDef* hspi);
+static void flash_write_enable(SPI_HandleTypeDef* hspi);
 
 
 extern SPI_HandleTypeDef hspi3;
@@ -17,9 +21,6 @@ extern SPI_HandleTypeDef hspi3;
 #define FLASH_CMD_CHIP_ERASE      0xC7
 #define FLASH_CMD_UNIQUE_ID       0x4B
 #define FLASH_CMD_JEDEC           0x9F
-
-// Typical flash page size
-#define SPIFLASH_PAGE_SIZE           256
 
 // Replace with your Flash's WIP (Write In Progress) bit mask
 #define FLASH_WIP_BIT             0x01
@@ -105,12 +106,14 @@ void flash_erase_chip(SPI_HandleTypeDef* hspi)
     FLASH_CS_LOW();
     HAL_SPI_Transmit(hspi, &cmd, 1, HAL_MAX_DELAY);
     FLASH_CS_HIGH();
-    flash_wait_for_ready(hspi);
+    uint32_t tt_ready = flash_wait_for_ready(hspi);
+    printf("flash_erase_chip: time_waited=%.6fs \n", (float)tt_ready / (float)CPU_CLK);
+
 }
 
 // ssssssssssssssss
 // Public: Read from flash
-void flash_read_poll(uint32_t address, uint8_t *buffer, uint32_t length, SPI_HandleTypeDef* hspi)
+void flash_read_poll(uint32_t address, void *buffer, uint32_t length, SPI_HandleTypeDef* hspi)
 {
 	// throughput ~2/5 theoretical maximum, 4Mbps on 10.24Mhz spi link
     uint8_t cmd[4];
@@ -142,7 +145,7 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi) {
     }
 }
 
-void flash_read_dma(uint32_t address, uint8_t *rx_buffer, uint32_t length, SPI_HandleTypeDef* hspi)
+void flash_read_dma(uint32_t address, void *rx_buffer, uint32_t length, SPI_HandleTypeDef* hspi)
 {
 	// throughput nearly 75% of theoretical max (7.64Mbps on 10.24Mhz SPI)
     uint32_t t0 = DWT->CYCCNT;
@@ -174,11 +177,11 @@ void flash_read_dma(uint32_t address, uint8_t *rx_buffer, uint32_t length, SPI_H
     FLASH_CS_HIGH();
 
     uint32_t tt = DWT->CYCCNT - t0;
-    printf("flash_read_DMA: %.6fs, waitready: %.6fs \n",
-    		(float)tt / (float)CPU_CLK);
+    printf("flash_read_DMA, addr=%.8X, elapsed=: %.6fs \n",
+    		address, (float)tt / (float)CPU_CLK);
 }
 
-void flash_read_dma_ready(uint32_t address, uint8_t *buffer, uint32_t length, SPI_HandleTypeDef *hspi)
+void flash_read_dma_ready(uint32_t address, void *buffer, uint32_t length, SPI_HandleTypeDef *hspi)
 {
     uint8_t cmd[4];
     static uint8_t dummy_tx[256]; // make sure this is >= max transfer size
@@ -209,7 +212,7 @@ void flash_read_dma_ready(uint32_t address, uint8_t *buffer, uint32_t length, SP
 }
 
 // Public: Program one page (up to 256 bytes)
-void flash_page_program_poll(uint32_t address, const uint8_t *data, uint32_t length, SPI_HandleTypeDef* hspi)
+void flash_page_program_poll(uint32_t address, const void *data, uint32_t length, SPI_HandleTypeDef* hspi)
 {
 	// throughput 3MBb/s, major limiting factor is the ~0.5 ms per page delay
 	// using DMA doesn't affect thoughput (but reduces CPU load)
@@ -237,7 +240,7 @@ void flash_page_program_poll(uint32_t address, const uint8_t *data, uint32_t len
 }
 
 
-void flash_page_program_dma(uint32_t address, const uint8_t *data, uint32_t length, SPI_HandleTypeDef* hspi)
+void flash_page_program_dma(uint32_t address, const void *data, uint32_t length, SPI_HandleTypeDef* hspi)
 {
     uint32_t t0 = DWT->CYCCNT;
 
@@ -273,8 +276,64 @@ void flash_page_program_dma(uint32_t address, const uint8_t *data, uint32_t leng
     uint32_t tt = DWT->CYCCNT - t0;
     printf("flash_page_write_dma @0x%.8X total: %.6fs, time_wait=%.6fs \n", address, (float)tt / (float)CPU_CLK, (float)tt_ready / (float)CPU_CLK);
 
-
 }
+
+
+// Global flag or function pointer to track flash DMA completion
+volatile int flash_dma_busy = 0;
+
+// You can optionally point this to your own handler
+__attribute__((weak)) void flash_dma_done_handler(void)
+{
+    // User-defined ISR-style callback
+    printf("Flash DMA complete\n");
+}
+
+// Call this to start the flash program
+void flash_page_program_dma_async(uint32_t address, const void *data, uint32_t length, SPI_HandleTypeDef* hspi)
+{
+    if (length > SPIFLASH_PAGE_SIZE) return;
+
+    static uint8_t tx_buf[SPIFLASH_PAGE_SIZE + 4];
+    uint8_t cmd[4] = {
+        FLASH_CMD_PAGE_PROGRAM,
+        (uint8_t)(address >> 16),
+        (uint8_t)(address >> 8),
+        (uint8_t)(address >> 0)
+    };
+
+    memcpy(tx_buf, cmd, 4);
+    memcpy(&tx_buf[4], data, length);
+
+    flash_write_enable(hspi);
+
+    FLASH_CS_LOW();
+
+    flash_dma_busy = 1;  // Mark transfer in progress
+    HAL_SPI_Transmit_DMA(hspi, tx_buf, length + 4);
+}
+
+// Hook into HAL's DMA complete callback
+void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi)
+{
+    if (hspi->Instance == SPI3 && flash_dma_busy) {
+        flash_dma_busy = 0;
+
+        FLASH_CS_HIGH();
+
+        // Optionally wait for flash WIP here, or defer
+        flash_wait_for_ready(hspi);
+
+        // Call user-defined handler
+        flash_dma_done_handler();
+    }
+}
+
+
+
+
+
+
 
 // Public: Erase 4K sector
 void flash_erase_sector(uint32_t address, SPI_HandleTypeDef* hspi)
@@ -291,13 +350,15 @@ void flash_erase_sector(uint32_t address, SPI_HandleTypeDef* hspi)
     HAL_SPI_Transmit(hspi, cmd, 4, HAL_MAX_DELAY);
     FLASH_CS_HIGH();
 
-    flash_wait_for_ready(hspi);
+    uint32_t tt_ready = flash_wait_for_ready(hspi);
+    printf("flash_erase_sector#%d: time_waited=%.6fs \n", address, (float)tt_ready / (float)CPU_CLK);
 }
 
-void flash_read_jedec_id(SPI_HandleTypeDef* hspi)
+uint32_t flash_read_jedec_id(SPI_HandleTypeDef* hspi)
 {
     uint8_t cmd = FLASH_CMD_JEDEC;
     uint8_t id[3] = {0};
+    uint32_t devid = 0;
 
     FLASH_CS_LOW();
     HAL_SPI_Transmit(hspi, &cmd, 1, HAL_MAX_DELAY);
@@ -305,6 +366,12 @@ void flash_read_jedec_id(SPI_HandleTypeDef* hspi)
     FLASH_CS_HIGH();
 
     printf("Flash JEDEC ID: %02X %02X %02X\n", id[0], id[1], id[2]);
+
+    devid |= ( (uint32_t)(id[0]) << 16 );
+    devid |= ( (uint32_t)(id[1]) << 8 );
+    devid |= ( (uint32_t)(id[2]) );
+
+    return devid;
 }
 
 void flash_read_uuid(SPI_HandleTypeDef* hspi)
@@ -331,14 +398,6 @@ void spi_test(SPI_HandleTypeDef* hspi)
 {
 
 	//
-
-	printf("\n\n\nstarting\n\n\n");
-
-	HAL_Delay(2000);
-
-	printf("\n\n\nstarting\n\n\n");
-
-
 	//printf("eraseing chip\n");
 	//flash_erase_chip(&hspi3);
 
@@ -360,7 +419,7 @@ void spi_test(SPI_HandleTypeDef* hspi)
 	{
 		  printf("reading flash %.8X\n", 256*i);
 		  uint8_t fbuffer[256];
-		  flash_read_poll(256*i, fbuffer, 256, &hspi3);
+		  flash_read_dma(256*i, fbuffer, 256, &hspi3);
 		  printf ("flash_bytes = %.2X, %.2X, %.2X, %.2X %.2X, %.2X, %.2X, %.2X %.2X, %.2X, %.2X, %.2X %.2X, %.2X, %.2X, %.2X %.2X, %.2X, %.2X, %.2X %.2X, %.2X, %.2X, %.2X %.2X, %.2X, %.2X, %.2X %.2X, %.2X, %.2X, %.2X   \n",
 					  fbuffer[0], fbuffer[1], fbuffer[2], fbuffer[3], fbuffer[4], fbuffer[5], fbuffer[6], fbuffer[7],
 					  fbuffer[8], fbuffer[9], fbuffer[10], fbuffer[11], fbuffer[12], fbuffer[13], fbuffer[14], fbuffer[15],
