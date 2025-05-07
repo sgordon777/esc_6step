@@ -9,6 +9,7 @@
 
 #include "stm32g4xx.h"
 
+
 //#define PAGE_SIZE 			(256)
 #define PAGE_SIZE_LOG 		(8)
 #define TRACE_ERROR_BASE 	(1<<28)
@@ -17,6 +18,8 @@
 #define TRACE_ERROR_SPIFLASH_FAILED (TRACE_ERROR_BASE + 3)
 #define TRACE_ERROR_NOT_ENOUGH_SPACE 	(TRACE_ERROR_BASE + 4)
 #define TRACE_ERROR_INVALID_PARAM  (TRACE_ERROR_BASE + 5)
+#define TRACE_ERROR_INVALID_RECORD_LEN  (TRACE_ERROR_BASE + 6)
+
 
 #define PAGE_EMPTY (0)
 #define PAGE_TRACE_HEADER (1)
@@ -26,6 +29,13 @@
 #define TRACE_STAT_READY (1)
 #define TRACE_STAT_STREAMING (2)
 #define TRACE_STAT_DONE (3)
+
+
+/*
+ *
+ *
+ * wr,0,28, 85,83,69,74, 69,73,68,83, 85,79,52,68, 78,73,83,82, 4,0,0,0, 0,4,0,0, 0,0,0,0
+*/
 
 #define TRACE_ID_1 (0x4a455355)
 #define TRACE_ID_2 (0x53444945)
@@ -37,9 +47,11 @@ typedef struct {
 	uint32_t id2;
 	uint32_t id3;
 	uint32_t id4;
-	uint32_t record_len_blocks;
-	uint32_t record_len_bytes;
+	uint32_t trace_file_len_p;
+	uint32_t trace_file_len_b;
 	uint32_t checksum;
+	uint32_t header_len_b;
+	uint32_t header_ver;
 } trace_header_t;
 
 
@@ -60,13 +72,12 @@ typedef struct {
 
 	// INITIALIZED
 	uint8_t* buffer_start;				// start address of circular buffer
-	uint16_t buffer_len_b;				// size of circular buffer
-	uint16_t trace_record_len_b; 		// size of trace record
-	uint16_t trace_len_b; 				// desired size of tracebuffer in bytes
+	uint16_t buffer_len_b;				// size of circular buffer in bytes
+	uint16_t trace_entry_len_b; 		// size of trace file
+	uint32_t trace_file_len_b;			// desired size of tracebuffer in bytes
 	uint32_t flash_len_b;  				// size of flash in bytes
 	trace_ptr_len_pair_t tracevals[];	// variable length of address/size pairs to trace
 } trace_object_t;
-
 
 
 uint32_t trace_init(trace_object_t* trace_obj, size_t alloc_size, SPI_HandleTypeDef* hspi);

@@ -107,7 +107,9 @@ void flash_erase_chip(SPI_HandleTypeDef* hspi)
     HAL_SPI_Transmit(hspi, &cmd, 1, HAL_MAX_DELAY);
     FLASH_CS_HIGH();
     uint32_t tt_ready = flash_wait_for_ready(hspi);
+#ifdef SPIFLASH_VERBOSE
     printf("flash_erase_chip: time_waited=%.6fs \n", (float)tt_ready / (float)CPU_CLK);
+#endif
 
 }
 
@@ -119,8 +121,9 @@ void flash_read_poll(uint32_t address, void *buffer, uint32_t length, SPI_Handle
     uint8_t cmd[4];
     uint8_t dummy[256] = {0}; // dma
 
-
+#ifdef SPIFLASH_VERBOSE
     uint32_t t0 = DWT->CYCCNT;
+#endif
     cmd[0] = FLASH_CMD_READ_DATA;
     cmd[1] = (address >> 16) & 0xFF;
     cmd[2] = (address >> 8) & 0xFF;
@@ -131,9 +134,11 @@ void flash_read_poll(uint32_t address, void *buffer, uint32_t length, SPI_Handle
     HAL_SPI_Receive(hspi, buffer, length, HAL_MAX_DELAY);
     FLASH_CS_HIGH();
 
+#ifdef SPIFLASH_VERBOSE
     uint32_t tt = DWT->CYCCNT - t0;
     printf("flash_read: %.6fs, waitready: %.6fs \n",
     		(float)tt / (float)CPU_CLK);
+#endif
 
 }
 
@@ -148,7 +153,9 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi) {
 void flash_read_dma(uint32_t address, void *rx_buffer, uint32_t length, SPI_HandleTypeDef* hspi)
 {
 	// throughput nearly 75% of theoretical max (7.64Mbps on 10.24Mhz SPI)
-    uint32_t t0 = DWT->CYCCNT;
+#ifdef SPIFLASH_VERBOSE
+	uint32_t t0 = DWT->CYCCNT;
+#endif
 
     uint8_t cmd[4] = {
         FLASH_CMD_READ_DATA,
@@ -176,9 +183,11 @@ void flash_read_dma(uint32_t address, void *rx_buffer, uint32_t length, SPI_Hand
 
     FLASH_CS_HIGH();
 
+#ifdef SPIFLASH_VERBOSE
     uint32_t tt = DWT->CYCCNT - t0;
     printf("flash_read_DMA, addr=%.8X, elapsed=: %.6fs \n",
     		address, (float)tt / (float)CPU_CLK);
+#endif
 }
 
 void flash_read_dma_ready(uint32_t address, void *buffer, uint32_t length, SPI_HandleTypeDef *hspi)
@@ -217,8 +226,9 @@ void flash_page_program_poll(uint32_t address, const void *data, uint32_t length
 	// throughput 3MBb/s, major limiting factor is the ~0.5 ms per page delay
 	// using DMA doesn't affect thoughput (but reduces CPU load)
     if (length > SPIFLASH_PAGE_SIZE) return;  // Can't program more than a page
-
+#ifdef SPIFLASH_VERBOSE
     uint32_t t0 = DWT->CYCCNT;
+#endif
 
     flash_write_enable(hspi);
 
@@ -234,16 +244,18 @@ void flash_page_program_poll(uint32_t address, const void *data, uint32_t length
     FLASH_CS_HIGH();
 
     uint32_t tt_ready = flash_wait_for_ready(hspi);
-
+#ifdef SPIFLASH_VERBOSE
     uint32_t tt = DWT->CYCCNT - t0;
     printf("flash_page_write_poll @0x%.8X total: %.6fs, time_wait=%.6fs \n", address, (float)tt / (float)CPU_CLK, (float)tt_ready / (float)CPU_CLK);
+#endif
 }
 
 
 void flash_page_program_dma(uint32_t address, const void *data, uint32_t length, SPI_HandleTypeDef* hspi)
 {
+#ifdef SPIFLASH_VERBOSE
     uint32_t t0 = DWT->CYCCNT;
-
+#endif
     if (length > SPIFLASH_PAGE_SIZE) return;  // Max 256 bytes per page
 
     // Command + 24-bit address
@@ -272,10 +284,10 @@ void flash_page_program_dma(uint32_t address, const void *data, uint32_t length,
 
     // Wait for the write to finish (poll WIP bit)
     uint32_t tt_ready = flash_wait_for_ready(&hspi3);
-
+#ifdef SPIFLASH_VERBOSE
     uint32_t tt = DWT->CYCCNT - t0;
     printf("flash_page_write_dma @0x%.8X total: %.6fs, time_wait=%.6fs \n", address, (float)tt / (float)CPU_CLK, (float)tt_ready / (float)CPU_CLK);
-
+#endif
 }
 
 

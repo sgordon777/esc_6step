@@ -6,6 +6,10 @@
  */
 #include "stm32g4xx.h"
 
+// Global flag or function pointer to track flash DMA completion
+extern volatile int flash_dma_busy;
+
+
 #ifndef SPIFLASH_H_
 #define SPIFLASH_H_
 

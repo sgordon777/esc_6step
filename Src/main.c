@@ -170,14 +170,15 @@ uint16_t bemf_raw = 0;
 
 // 1 block = 256 bytes
 #define TRACEBUF_SZ_B (2048)
-#define TRACE_LEN_B (32768 * 6)
+//#define TRACE_FILE_LEN_B (32768 * 8)
+#define TRACE_FILE_LEN_B (256 * 8)
 uint8_t trace_buf[TRACEBUF_SZ_B];
 
 trace_object_t traceobj = {
 		.buffer_start = trace_buf,
 		.buffer_len_b = TRACEBUF_SZ_B,
-		.trace_record_len_b = 6,
-		.trace_len_b = TRACE_LEN_B,
+		.trace_entry_len_b = 8,
+		.trace_file_len_b = TRACE_FILE_LEN_B,
 		.flash_len_b = 1024*1024*16,
 		.tracevals = {
 		{&encpos_g, 2},
@@ -498,6 +499,7 @@ int main(void)
 
   while (1)
   {
+#if 0
 	  // spinup handler
 	  TASK_HANDLER_EL = DWT->CYCCNT - TASK_HANDLER_t0;
 	  if (TASK_HANDLER_EL >= TASK_HANDLER_LIM)
@@ -562,6 +564,7 @@ int main(void)
 				  comm_state, speed_ndx, rpm_est, ref, ttf, delta_mod, maxk, bemf_sw, bemfdiff_sw, zc_sw, encpos);
 		  DIAG_HANDLER_t0 = DWT->CYCCNT;
 	  }
+#endif
 
 
     /* USER CODE END WHILE */
