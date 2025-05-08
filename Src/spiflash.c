@@ -297,8 +297,7 @@ volatile int flash_dma_busy = 0;
 // You can optionally point this to your own handler
 __attribute__((weak)) void flash_dma_done_handler(void)
 {
-    // User-defined ISR-style callback
-    printf("Flash DMA complete\n");
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
 }
 
 // Call this to start the flash program
@@ -306,6 +305,7 @@ void flash_page_program_dma_async(uint32_t address, const void *data, uint32_t l
 {
     if (length > SPIFLASH_PAGE_SIZE) return;
 
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);
     static uint8_t tx_buf[SPIFLASH_PAGE_SIZE + 4];
     uint8_t cmd[4] = {
         FLASH_CMD_PAGE_PROGRAM,

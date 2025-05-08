@@ -3,6 +3,10 @@
  *
  *  Created on: May 2, 2025
  *      Author: sgord
+ *
+ *
+*
+ *
  */
 
 #include "trace_spiflash.h"
@@ -10,18 +14,17 @@
 #include <assert.h>
 #include <string.h>
 #include <stdio.h>
+#include <string.h>
 
 
 void pack_trace_entry(trace_object_t* trace_obj);
-void flash_write_header(trace_object_t* trace_obj, SPI_HandleTypeDef* hspi);
-void flash_write_page(trace_object_t* trace_obj);
+void flash_write_header(trace_object_t* trace_obj, char* filename, SPI_HandleTypeDef* hspi);
+void flash_write_page(trace_object_t* trace_obj, SPI_HandleTypeDef* hspi);
 void print_trace_object(const trace_object_t *obj);
 void print_trace_header(const trace_header_t *hdr);
-uint32_t update_circ_ptr(uint32_t* curval, uint32_t inc, uint32_t* start_addr, uint32_t size);
-
-
+void calc_amount_data_space(trace_object_t* trace_obj, uint32_t* data, uint32_t* space);
+void update_circ_ptr(uint8_t* curval, uint32_t inc, uint8_t* start_addr, uint32_t size);
 uint32_t analyze_page(trace_header_t* header);
-
 
 
 uint32_t analyze_page(trace_header_t* header)
@@ -61,7 +64,7 @@ uint32_t analyze_page(trace_header_t* header)
 }
 
 
-uint32_t trace_init(trace_object_t* trace_obj, size_t alloc_size, SPI_HandleTypeDef* hspi)
+uint32_t trace_init(trace_object_t* trace_obj, size_t alloc_size, char* filename, SPI_HandleTypeDef* hspi)
 {
 	trace_header_t header;
 	uint32_t addr=0;
@@ -105,7 +108,9 @@ uint32_t trace_init(trace_object_t* trace_obj, size_t alloc_size, SPI_HandleType
 		uint32_t page_type = analyze_page(&header);
 		if (page_type == PAGE_TRACE_HEADER)
 		{
-			printf("--->Found file @%.8X, L=%.8X\n", addr, ( header.trace_file_len_p) * SPIFLASH_PAGE_SIZE);
+			char* filename = "not available before version 1";
+			if (header.ver >= 1) filename = header.trace_filename;
+			printf("--->Found file ver=%d, addr=%.8X, len(b)=%.8X, filename=%s\n", header.ver, addr, ( header.trace_file_len_p) * SPIFLASH_PAGE_SIZE, filename);
 			addr = addr + ( 1 + header.trace_file_len_p) * SPIFLASH_PAGE_SIZE;
 		}
 		else if (page_type == PAGE_EMPTY)
@@ -140,19 +145,19 @@ uint32_t trace_init(trace_object_t* trace_obj, size_t alloc_size, SPI_HandleType
 
 	// prepare for tracing
 	trace_obj->amount_written_b = 0;
+	trace_obj->amount_read_b = 0;
 	trace_obj->write_ptr = trace_obj->buffer_start;
 	trace_obj->read_ptr = trace_obj->buffer_start;
 	trace_obj->flash_cur_addr = addr;
 	trace_obj->flash_start_addr = addr;
 	trace_obj->flash_cur_addr = addr;
 
-	trace_obj->stat = TRACE_STAT_READY;
+	trace_obj->stat = TRACE_STAT_STREAMING;
 	//trace_obj->num_tracevals = sizeof(trace_obj->tracevals) / sizeof(trace_ptr_len_pair_t) ;
 
 
-
 	// {TBD} trigger writing of header
-	flash_write_header(trace_obj, hspi);
+	flash_write_header(trace_obj, filename, hspi);
 
 
 
@@ -165,28 +170,53 @@ void pack_trace_entry(trace_object_t* trace_obj)
 	for (int i = 0; i< trace_obj->num_tracevals; ++i)
 		memcpy( trace_obj->write_ptr, trace_obj->tracevals[i].ptr, trace_obj->tracevals[i].len_b  );
 
-	trace_obj->write_ptr = update_circ_ptr(trace_obj->write_ptr, trace_obj->trace_entry_len_b, trace_obj->buffer_start, trace_obj->trace_file_len_b);
+	update_circ_ptr(trace_obj->write_ptr, trace_obj->trace_entry_len_b, trace_obj->buffer_start, trace_obj->trace_file_len_b);
 	trace_obj->amount_written_b += trace_obj->trace_entry_len_b;
-
-
 }
 
 void trace(trace_object_t* trace_obj, SPI_HandleTypeDef* hspi)
 {
 
-	// store in circular buffer
+	if ( trace_obj->stat == TRACE_STAT_DONE )
+		return;
 
-	// read trace data and pack into record
-	pack_trace_entry(trace_obj);
+	// get data/space
+	uint32_t space, data;
+	calc_amount_data_space(trace_obj, &data, &space);
 
-
-	// If we just finished a page, trigger flash storage
-	if ( (trace_obj->amount_written_b > 0) && ( (trace_obj->amount_written_b % SPIFLASH_PAGE_SIZE) == 0) )
+	// write entry
+	if (trace_obj->stat == TRACE_STAT_STREAMING)
 	{
-		flash_write_page(trace_obj);
+		// out of buffer space?
+		assert (space > trace_obj->trace_entry_len_b);
+
+		// read trace data and pack into record
+		pack_trace_entry(trace_obj);
+
+		// done?
+		if (trace_obj->amount_written_b >= trace_obj->trace_file_len_b)
+			trace_obj->stat = TRACE_STAT_FINISHING;
 	}
 
-	// done?
+	if (trace_obj->amount_read_b >= trace_obj->trace_file_len_b)
+	{
+		// nothing left to do
+		trace_obj->stat = TRACE_STAT_DONE;
+		return;
+	}
+
+	// manage flash writing
+	if ( flash_dma_busy ) return;
+	if (
+			(trace_obj->amount_written_b > 0) &&
+			((trace_obj->amount_written_b & 0x00000007f) == 0) &&
+			(data > SPIFLASH_PAGE_SIZE)
+		)
+	{
+
+//		flash_write_page(trace_obj, hspi);
+	}
+
 
 }
 
@@ -195,26 +225,36 @@ void trace_end(trace_object_t* trace_obj, SPI_HandleTypeDef* hspi)
 }
 
 
-void flash_write_header(trace_object_t* trace_obj, SPI_HandleTypeDef* hspi)
+void flash_write_header(trace_object_t* trace_obj, char* filename, SPI_HandleTypeDef* hspi)
 {
 	assert(trace_obj->trace_file_len_b % SPIFLASH_PAGE_SIZE  == 0);
 	trace_header_t hdr = {TRACE_ID_1, TRACE_ID_2, TRACE_ID_3, TRACE_ID_4,
 			 trace_obj->trace_file_len_b/SPIFLASH_PAGE_SIZE, trace_obj->trace_file_len_b, 0, sizeof(trace_header_t), 1};
+	hdr.ver = TRACE_LIB_VER;
+	strncpy(hdr.trace_filename, filename, FILENAME_MAX_LEN);
+	hdr.trace_filename[FILENAME_MAX_LEN-1] = 0; // ensure null termination
 
 	while (flash_dma_busy != 0) {}
+
 	print_trace_header(&hdr);
 	print_trace_object(trace_obj);
 
 	flash_page_program_dma_async(trace_obj->flash_cur_addr, &hdr, sizeof(trace_header_t), hspi);
+	trace_obj->flash_cur_addr += SPIFLASH_PAGE_SIZE;
+
 
 }
 
-void flash_write_page(trace_object_t* trace_obj)
+void flash_write_page(trace_object_t* trace_obj, SPI_HandleTypeDef* hspi)
 {
-
+	assert(flash_dma_busy);
+	flash_page_program_dma_async(trace_obj->flash_cur_addr, trace_obj->read_ptr, SPIFLASH_PAGE_SIZE, hspi);
+	update_circ_ptr(trace_obj->read_ptr, SPIFLASH_PAGE_SIZE, trace_obj->buffer_start, trace_obj->buffer_len_b );
+	trace_obj->flash_cur_addr += SPIFLASH_PAGE_SIZE;
+	trace_obj->amount_read_b += SPIFLASH_PAGE_SIZE;
 }
 
-uint32_t update_circ_ptr(uint32_t* curval, uint32_t inc, uint32_t* start_addr, uint32_t size)
+void update_circ_ptr(uint8_t* curval, uint32_t inc, uint8_t* start_addr, uint32_t size)
 {
 	curval += inc;
 	if (curval >= (start_addr + size)) curval -= size;
@@ -233,7 +273,8 @@ void print_trace_header(const trace_header_t *hdr) {
     printf("Tracefile Length (blocks) : %u bytes\n",  hdr->trace_file_len_b);
     printf("Checksum                  : 0x%08X\n", hdr->checksum);
     printf("Header Length             : %u bytes\n", hdr->header_len_b);
-    printf("Header Version            : %u\n", hdr->header_ver);
+    printf("Header Version            : %u\n", hdr->ver);
+    printf("Trace Filename            : %s\n", hdr->trace_filename);
     printf("============================\n");
 }
 
@@ -248,6 +289,7 @@ void print_trace_object(const trace_object_t *obj) {
     printf("stat                     : 0x%04X\n", obj->stat);
     printf("num_tracevals            : %u\n", obj->num_tracevals);
     printf("amount_written_b         : %u\n", obj->amount_written_b);
+    printf("amount_read_b            : %u\n", obj->amount_read_b);
     printf("buffer_start             : %p\n", obj->buffer_start);
     printf("buffer_len_b             : %u\n", obj->buffer_len_b);
     printf("trace_entry_len_b        : %u\n", obj->trace_entry_len_b);
@@ -260,6 +302,13 @@ void print_trace_object(const trace_object_t *obj) {
     }
 
     printf("=======================\n");
+}
+
+void calc_amount_data_space(trace_object_t* trace_obj, uint32_t* data, uint32_t* space)
+{
+	*data = (trace_obj->write_ptr - trace_obj->read_ptr);
+	if (*data < 0) *data += trace_obj->buffer_len_b;
+	*space = trace_obj->buffer_len_b - *data - 1;
 }
 
 

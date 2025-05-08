@@ -129,3 +129,37 @@ transitioning from measure to spinup, vref=3.370117 x=1
 state=1, spd=0, RPM=0, ref=1, com_delt=0.0, com_deltk=[0/0] com_bemfsw=0, com_bemfdiff=0, sw_zc=0, qenc=0
 transitioning from spin-up to BEMF commutation
 
+
+
+
+ *
+ *      Circular buffer (before read / before write)
+ *      H/D = buffered block
+ *      - - read block
+ *
+ *             R                W
+ *      -------DDDDDHDDDDDHDDDDD--------
+ *      *                              *
+ *      |                              |
+ *    START_ADDR     <-LEN->       END_ADDR
+ *
+ *                W              R
+ *      DDDDDHDDDD---------------DDDDDDD
+ *      *                              *
+ *      |                              |
+ *    START_ADDR     <-LEN->       END_ADDR
+ *
+ *
+ *        RW
+ *		--D-
+ *
+ *		W
+ *		R
+ *		----
+ *
+ *
+ *      AMOUNT_DATA = W - R ; if AMOUNT_DATA < 0, AMOUNT_DATA += LEN
+ *      AMOUNT_SPACE = LEN - AMOUNT_DATA - 1
+ *
+ *
+ 

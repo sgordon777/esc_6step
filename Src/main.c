@@ -291,6 +291,9 @@ HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET);				// run commutator
         last_bemf = bemf_raw;
 HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
 
+		trace(&traceobj, &hspi3);
+
+
     }
 }
 
@@ -387,7 +390,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     }
     else if (GPIO_Pin == GPIO_PIN_12)
     {
-        HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);  // e.g., toggle an LED
+        //HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_5);  // e.g., toggle an LED
 
     }
 
@@ -492,14 +495,14 @@ int main(void)
   HAL_Delay(2000);
 
 
-  trace_init(&traceobj, sizeof(traceobj), &hspi3);
+  trace_init(&traceobj, sizeof(traceobj), "2208_test#1_speed55_v0.54_05072025_001", &hspi3);
 
 
 //  spi_test(&hspi3);
 
   while (1)
   {
-#if 0
+#if 1
 	  // spinup handler
 	  TASK_HANDLER_EL = DWT->CYCCNT - TASK_HANDLER_t0;
 	  if (TASK_HANDLER_EL >= TASK_HANDLER_LIM)

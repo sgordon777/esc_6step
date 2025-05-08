@@ -11,6 +11,7 @@
 
 
 //#define PAGE_SIZE 			(256)
+#define TRACE_LIB_VER (1)
 #define PAGE_SIZE_LOG 		(8)
 #define TRACE_ERROR_BASE 	(1<<28)
 #define TRACE_ERROR_FORMAT 	(TRACE_ERROR_BASE + 1)
@@ -20,6 +21,8 @@
 #define TRACE_ERROR_INVALID_PARAM  (TRACE_ERROR_BASE + 5)
 #define TRACE_ERROR_INVALID_RECORD_LEN  (TRACE_ERROR_BASE + 6)
 
+#define FILENAME_MAX_LEN (128)
+
 
 #define PAGE_EMPTY (0)
 #define PAGE_TRACE_HEADER (1)
@@ -28,7 +31,8 @@
 #define TRACE_STAT_UNINITIALIZED (0)
 #define TRACE_STAT_READY (1)
 #define TRACE_STAT_STREAMING (2)
-#define TRACE_STAT_DONE (3)
+#define TRACE_STAT_FINISHING (3)
+#define TRACE_STAT_DONE (4)
 
 
 /*
@@ -49,9 +53,10 @@ typedef struct {
 	uint32_t id4;
 	uint32_t trace_file_len_p;
 	uint32_t trace_file_len_b;
-	uint32_t checksum;
-	uint32_t header_len_b;
-	uint32_t header_ver;
+	uint16_t checksum;
+	uint16_t header_len_b;
+	uint32_t ver;
+	char trace_filename[FILENAME_MAX_LEN];
 } trace_header_t;
 
 
@@ -69,6 +74,7 @@ typedef struct {
 	uint16_t stat;						// state of trace system
 	uint16_t num_tracevals;				// number of tracevals entries
 	uint32_t amount_written_b;			// number of bytes written
+	uint32_t amount_read_b;				// number of bytes read
 
 	// INITIALIZED
 	uint8_t* buffer_start;				// start address of circular buffer
@@ -80,7 +86,7 @@ typedef struct {
 } trace_object_t;
 
 
-uint32_t trace_init(trace_object_t* trace_obj, size_t alloc_size, SPI_HandleTypeDef* hspi);
+uint32_t trace_init(trace_object_t* trace_obj, size_t alloc_size, char* filename, SPI_HandleTypeDef* hspi);
 void trace(trace_object_t* trace_obj, SPI_HandleTypeDef* hspi);
 void trace_end(trace_object_t* trace_obj, SPI_HandleTypeDef* hspi);
 
