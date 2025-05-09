@@ -171,10 +171,12 @@ uint16_t bemf_raw = 0;
 // 1 block = 256 bytes
 #define TRACEBUF_SZ_B (2048)
 //#define TRACE_FILE_LEN_B (32768 * 8)
-#define TRACE_FILE_LEN_B (256 * 8)
+#define TRACE_FILE_LEN_B (1024 * 4)
 uint8_t trace_buf[TRACEBUF_SZ_B];
 
-trace_object_t traceobj = {
+#if 0
+	trace_object_t traceobj = {
+		.stat = 0,
 		.buffer_start = trace_buf,
 		.buffer_len_b = TRACEBUF_SZ_B,
 		.trace_entry_len_b = 8,
@@ -185,6 +187,27 @@ trace_object_t traceobj = {
 		{&bemf_raw, 2},
 		{&comm_state,1},
 		{&comm_step, 1}
+		}
+};
+#endif
+
+uint32_t ctr32=0;
+uint16_t ctr16=0;
+uint8_t ctr8up=0;
+uint8_t ctr8dn=0xff;
+
+trace_object_t traceobj = {
+		.stat = 0,
+		.buffer_start = trace_buf,
+		.buffer_len_b = TRACEBUF_SZ_B,
+		.trace_entry_len_b = 8,
+		.trace_file_len_b = TRACE_FILE_LEN_B,
+		.flash_len_b = 1024*1024*16,
+		.tracevals = {
+		{&ctr32, 4},
+		{&ctr16, 2},
+		{&ctr8up,1},
+		{&ctr8dn, 1}
 		}
 };
 
@@ -293,6 +316,10 @@ HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
 
 		trace(&traceobj, &hspi3);
 
+		ctr32 = DWT->CYCCNT;
+		ctr16++ ;
+		ctr8up++ ;
+		ctr8dn--;
 
     }
 }
@@ -494,15 +521,17 @@ int main(void)
 
   HAL_Delay(2000);
 
+  printf("spi status reg = %.8X\n", flash_read_status(&hspi3));
 
-  trace_init(&traceobj, sizeof(traceobj), "2208_test#1_speed55_v0.54_05072025_001", &hspi3);
+  uint32_t trace_addr = trace_init(&traceobj, sizeof(traceobj), "2208_test#1_speed55_v0.54_05072025_001", &hspi3);
+
 
 
 //  spi_test(&hspi3);
 
   while (1)
   {
-#if 1
+#if 0
 	  // spinup handler
 	  TASK_HANDLER_EL = DWT->CYCCNT - TASK_HANDLER_t0;
 	  if (TASK_HANDLER_EL >= TASK_HANDLER_LIM)
@@ -559,7 +588,7 @@ int main(void)
 
 
 	  uint32_t encpos = __HAL_TIM_GET_COUNTER(&htim2);
-
+//#if 0
 	  if (DIAG_HANDLER_EL >= DIAG_HANDLER_LIM)
 	  {
 		  uint32_t maxk = (uint32_t)( (ttf / CPU_CLK) * MOD_FREQ );

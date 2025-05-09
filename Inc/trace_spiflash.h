@@ -71,12 +71,12 @@ typedef struct {
 	uint8_t* read_ptr;					// circular buffer read pointer: data will be read from here
 	uint32_t flash_start_addr;			// start flash address (header will be written here)
 	uint32_t flash_cur_addr;			// current flash pointer
-	uint16_t stat;						// state of trace system
 	uint16_t num_tracevals;				// number of tracevals entries
 	uint32_t amount_written_b;			// number of bytes written
 	uint32_t amount_read_b;				// number of bytes read
 
 	// INITIALIZED
+	uint16_t stat;						// state of trace system
 	uint8_t* buffer_start;				// start address of circular buffer
 	uint16_t buffer_len_b;				// size of circular buffer in bytes
 	uint16_t trace_entry_len_b; 		// size of trace file
