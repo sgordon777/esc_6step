@@ -86,7 +86,7 @@ typedef struct {
 } trace_object_t;
 
 
-uint32_t trace_init(trace_object_t* trace_obj, size_t alloc_size, char* filename, SPI_HandleTypeDef* hspi);
+uint32_t trace_init(trace_object_t* trace_obj, char* filename, SPI_HandleTypeDef* hspi);
 void trace(trace_object_t* trace_obj, SPI_HandleTypeDef* hspi);
 void trace_end(trace_object_t* trace_obj, SPI_HandleTypeDef* hspi);
 

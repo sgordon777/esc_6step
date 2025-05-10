@@ -203,6 +203,7 @@ trace_object_t traceobj = {
 		.trace_entry_len_b = 8,
 		.trace_file_len_b = TRACE_FILE_LEN_B,
 		.flash_len_b = 1024*1024*16,
+		.num_tracevals = 4,
 		.tracevals = {
 		{&ctr32, 4},
 		{&ctr16, 2},
@@ -523,7 +524,7 @@ int main(void)
 
   printf("spi status reg = %.8X\n", flash_read_status(&hspi3));
 
-  uint32_t trace_addr = trace_init(&traceobj, sizeof(traceobj), "2208_test#1_speed55_v0.54_05072025_001", &hspi3);
+  uint32_t trace_addr = trace_init(&traceobj, "2208_test#1_speed55_v0.54_05072025_002", &hspi3);
 
 
 

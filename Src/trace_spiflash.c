@@ -64,12 +64,10 @@ uint32_t analyze_page(trace_header_t* header)
 }
 
 
-uint32_t trace_init(trace_object_t* trace_obj, size_t alloc_size, char* filename, SPI_HandleTypeDef* hspi)
+uint32_t trace_init(trace_object_t* trace_obj, char* filename, SPI_HandleTypeDef* hspi)
 {
 	trace_header_t header;
 	uint32_t addr=0;
-
-	trace_obj->num_tracevals = ( alloc_size - sizeof (trace_obj) ) / sizeof(trace_ptr_len_pair_t);
 
 	trace_obj->stat = TRACE_STAT_UNINITIALIZED;
 	// test flash
@@ -168,9 +166,10 @@ void pack_trace_entry(trace_object_t* trace_obj)
 {
 	uint8_t* init_write = trace_obj->write_ptr;
 	for (int i = 0; i< trace_obj->num_tracevals; ++i)
+	{
 		memcpy( trace_obj->write_ptr, trace_obj->tracevals[i].ptr, trace_obj->tracevals[i].len_b  );
-
-	update_circ_ptr(&trace_obj->write_ptr, trace_obj->trace_entry_len_b, trace_obj->buffer_start, trace_obj->buffer_len_b);
+		update_circ_ptr(&trace_obj->write_ptr, trace_obj->tracevals[i].len_b , trace_obj->buffer_start, trace_obj->buffer_len_b);
+	}
 	trace_obj->amount_written_b += trace_obj->trace_entry_len_b;
 }
 
