@@ -23,8 +23,9 @@ void flash_write_page(trace_object_t* trace_obj, SPI_HandleTypeDef* hspi);
 void print_trace_object(const trace_object_t *obj);
 void print_trace_header(const trace_header_t *hdr);
 void calc_amount_data_space(trace_object_t* trace_obj, uint32_t* data, uint32_t* space);
-void update_circ_ptr(uint8_t** curval, uint32_t inc, uint8_t* start_addr, uint32_t size);
 uint32_t analyze_page(trace_header_t* header);
+
+#define CIRC_UPDATE(cur, inc, start, sz)  ( cur = (cur + inc) < (start + sz) ? (cur + inc) : (cur + inc - sz) )
 
 
 uint32_t analyze_page(trace_header_t* header)
@@ -69,7 +70,9 @@ uint32_t trace_init(trace_object_t* trace_obj, char* filename, SPI_HandleTypeDef
 	trace_header_t header;
 	uint32_t addr=0;
 
-	trace_obj->stat = TRACE_STAT_UNINITIALIZED;
+	if (trace_obj->stat != TRACE_STAT_UNINITIALIZED)
+		return TRACE_ERROR_INVALID_STATE;
+	//trace_obj->stat = TRACE_STAT_UNINITIALIZED;
 	// test flash
 	if ( flash_read_jedec_id(hspi) != 0xEF4018 )
 	{
@@ -98,7 +101,7 @@ uint32_t trace_init(trace_object_t* trace_obj, char* filename, SPI_HandleTypeDef
 		return TRACE_ERROR_INVALID_PARAM;
 	}
 
-	printf("\nSearching flash for empty page....\n", addr);
+	printf("\nSearching flash for empty page @%.8X....\n", addr);
 	do
 	{
 		// find flash start address
@@ -168,7 +171,7 @@ void pack_trace_entry(trace_object_t* trace_obj)
 	for (int i = 0; i< trace_obj->num_tracevals; ++i)
 	{
 		memcpy( trace_obj->write_ptr, trace_obj->tracevals[i].ptr, trace_obj->tracevals[i].len_b  );
-		update_circ_ptr(&trace_obj->write_ptr, trace_obj->tracevals[i].len_b , trace_obj->buffer_start, trace_obj->buffer_len_b);
+		CIRC_UPDATE(trace_obj->write_ptr,  trace_obj->tracevals[i].len_b,trace_obj->buffer_start, trace_obj->buffer_len_b  );
 	}
 	trace_obj->amount_written_b += trace_obj->trace_entry_len_b;
 }
@@ -200,18 +203,17 @@ void trace(trace_object_t* trace_obj, SPI_HandleTypeDef* hspi)
 		//trace_obj->stat, space, data, trace_obj->amount_written_b, trace_obj->amount_read_b, trace_obj->write_ptr, trace_obj->read_ptr);
 
 	}
+	if ( flash_dma_busy ) return;
 
 	if (trace_obj->amount_read_b >= trace_obj->trace_file_len_b)
 	{
 		// Finished writing flash
-		if ( flash_dma_busy ) return;
 		printf("--->Tracing completed\n");
 		trace_obj->stat = TRACE_STAT_DONE;
 		return;
 	}
 
 	// manage flash writing
-	if ( flash_dma_busy ) return;
 	if (
 			(trace_obj->amount_written_b > 0) &&
 			((trace_obj->amount_written_b & 0x00000007f) == 0) &&
@@ -222,7 +224,6 @@ void trace(trace_object_t* trace_obj, SPI_HandleTypeDef* hspi)
 
 		flash_write_page(trace_obj, hspi);
 	}
-
 
 }
 
@@ -245,7 +246,7 @@ void flash_write_header(trace_object_t* trace_obj, char* filename, SPI_HandleTyp
 	print_trace_header(&hdr);
 	print_trace_object(trace_obj);
 
-	flash_page_program_dma_async(trace_obj->flash_cur_addr, &hdr, sizeof(trace_header_t), hspi);
+	flash_page_program_poll(trace_obj->flash_cur_addr, &hdr, sizeof(trace_header_t), hspi);
 	trace_obj->flash_cur_addr += SPIFLASH_PAGE_SIZE;
 
 
@@ -254,20 +255,11 @@ void flash_write_header(trace_object_t* trace_obj, char* filename, SPI_HandleTyp
 void flash_write_page(trace_object_t* trace_obj, SPI_HandleTypeDef* hspi)
 {
 	assert(flash_dma_busy == 0);
-	flash_page_program_dma_async(trace_obj->flash_cur_addr, trace_obj->read_ptr, SPIFLASH_PAGE_SIZE, hspi);
-	update_circ_ptr(&trace_obj->read_ptr, SPIFLASH_PAGE_SIZE, trace_obj->buffer_start, trace_obj->buffer_len_b );
+	flash_page_program_dma_async(trace_obj->flash_cur_addr, trace_obj->read_ptr-4, SPIFLASH_PAGE_SIZE, hspi);
+	CIRC_UPDATE(trace_obj->read_ptr, SPIFLASH_PAGE_SIZE, trace_obj->buffer_start,  trace_obj->buffer_len_b  );
 	trace_obj->flash_cur_addr += SPIFLASH_PAGE_SIZE;
 	trace_obj->amount_read_b += SPIFLASH_PAGE_SIZE;
 }
-
-
-//#define CIRC_WRITE(cur, curpinc, startpsz, sz) cur = (curpinc) < (startpsz) ? (curpinc) : (curpinc - sz)
-void update_circ_ptr(uint8_t** curval, uint32_t inc, uint8_t* start_addr, uint32_t size)
-{
-	*curval += inc;
-	if (*curval >= (start_addr + size)) *curval -= size;
-}
-
 
 void print_trace_header(const trace_header_t *hdr) {
     if (!hdr) return;

@@ -106,7 +106,7 @@ uint32_t trg_buf[TRG_BUF_SZ];
 const int MOD_FREQ = 30000;
 uint16_t per = (int)( CPU_CLK / (2*MOD_FREQ) );
 // speed tables
-float speed_vals[] = {0.60, 0.70, 0.87, 0.99};
+float speed_vals[] = {0.70, 0.70, 0.87, 0.99};
 int NUM_SPEEDS = sizeof(speed_vals) >> 2;
 int speed_ndx = 0; // 0=
 
@@ -132,7 +132,7 @@ uint32_t comm_zz_pol[6] =       {1, 0, 1, 0, 1, 0};
 //#define COMM_MODE_PWMLOW
 float frq_start = 10;  // hz
 float frq_stop = 300;  // hz
-float frq_inc = 300; // hz/sec
+float frq_inc = 600; // hz/sec
 int hold_end_spinup = 0;
 int motor_pp = 7;
 float motor_res = 10;
@@ -167,48 +167,27 @@ uint32_t comm_duty;
 uint16_t encpos_g = 0;
 uint16_t bemf_raw = 0;
 
-
+int trace_trigger = 0;
 // 1 block = 256 bytes
 #define TRACEBUF_SZ_B (2048)
-//#define TRACE_FILE_LEN_B (32768 * 8)
-#define TRACE_FILE_LEN_B (1024 * 4)
-uint8_t trace_buf[TRACEBUF_SZ_B];
+#define TRACE_FILE_LEN_B (0x40000)
+uint8_t trace_buf[TRACEBUF_SZ_B+4];
 
-#if 0
+uint16_t handler_tim=0;
 	trace_object_t traceobj = {
 		.stat = 0,
-		.buffer_start = trace_buf,
+		.buffer_start = trace_buf+4,
 		.buffer_len_b = TRACEBUF_SZ_B,
 		.trace_entry_len_b = 8,
 		.trace_file_len_b = TRACE_FILE_LEN_B,
 		.flash_len_b = 1024*1024*16,
+		.num_tracevals = 5,
 		.tracevals = {
 		{&encpos_g, 2},
 		{&bemf_raw, 2},
 		{&comm_state,1},
-		{&comm_step, 1}
-		}
-};
-#endif
-
-uint32_t ctr32=0;
-uint16_t ctr16=0;
-uint8_t ctr8up=0;
-uint8_t ctr8dn=0xff;
-
-trace_object_t traceobj = {
-		.stat = 0,
-		.buffer_start = trace_buf,
-		.buffer_len_b = TRACEBUF_SZ_B,
-		.trace_entry_len_b = 8,
-		.trace_file_len_b = TRACE_FILE_LEN_B,
-		.flash_len_b = 1024*1024*16,
-		.num_tracevals = 4,
-		.tracevals = {
-		{&ctr32, 4},
-		{&ctr16, 2},
-		{&ctr8up,1},
-		{&ctr8dn, 1}
+		{&comm_step, 1},
+		{&handler_tim, 2}
 		}
 };
 
@@ -248,6 +227,9 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
     {
 HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
 		static uint16_t last_bemf = 0, bemf = 0;
+		uint32_t t0 = DWT->CYCCNT;
+
+
         bemf_raw = HAL_ADCEx_InjectedGetValue(hadc, ADC_INJECTED_RANK_1);
 
         //bemf = (bemf_raw + last_bemf) / 2;
@@ -282,7 +264,6 @@ HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);
 				static uint32_t last_t = 0;
 				static float y1 = 0;
 
-HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET);				// run commutator
 				commutator(comm_step, comm_duty);
 				++comm_step;
 				if (comm_step == 6) comm_step = 0;
@@ -303,7 +284,6 @@ HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET);				// run commutator
 				zc_sw = zc_pol;
 				bemfdiff_sw = (int32_t)bemf - (int32_t)last_bemf;
 				last_tick = mod_tick;
-HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET);				// run commutator
 
         	}
         }
@@ -313,14 +293,20 @@ HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET);				// run commutator
         ++mod_tick;
         ++comm_stabilize_count;
         last_bemf = bemf_raw;
-HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
 
-		trace(&traceobj, &hspi3);
 
-		ctr32 = DWT->CYCCNT;
-		ctr16++ ;
-		ctr8up++ ;
-		ctr8dn--;
+		if (trace_trigger == 2)
+		{
+//			HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_RESET);				// run commutator
+			trace(&traceobj, &hspi3);
+//			HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13, GPIO_PIN_SET);				// run commutator
+		}
+
+
+		HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_SET);
+
+		uint32_t t1 = DWT->CYCCNT;
+		handler_tim = (t1 - t0) & 0xFFFF; // time of this handler
 
     }
 }
@@ -520,19 +506,12 @@ int main(void)
 
   printf("\n\n\nstarting\n\n\n");
 
-  HAL_Delay(2000);
+  HAL_Delay(200);
 
   printf("spi status reg = %.8X\n", flash_read_status(&hspi3));
-
-  uint32_t trace_addr = trace_init(&traceobj, "2208_test#1_speed55_v0.54_05072025_002", &hspi3);
-
-
-
-//  spi_test(&hspi3);
-
   while (1)
   {
-#if 0
+#if 1
 	  // spinup handler
 	  TASK_HANDLER_EL = DWT->CYCCNT - TASK_HANDLER_t0;
 	  if (TASK_HANDLER_EL >= TASK_HANDLER_LIM)
@@ -555,6 +534,8 @@ int main(void)
 				  // start spinup
 				  comm_state = STATE_SPINUP;
 				  printf("transitioning from measure to spinup, vref=%f x=%u \n", x, ref);
+				  //uint32_t trace_addr = trace_init(&traceobj, "2208_test#1_speed55_v0.54_05152025_07", &hspi3);
+				  //trace_trigger = 2;
 
 			  }
 		  }
@@ -589,7 +570,6 @@ int main(void)
 
 
 	  uint32_t encpos = __HAL_TIM_GET_COUNTER(&htim2);
-//#if 0
 	  if (DIAG_HANDLER_EL >= DIAG_HANDLER_LIM)
 	  {
 		  uint32_t maxk = (uint32_t)( (ttf / CPU_CLK) * MOD_FREQ );

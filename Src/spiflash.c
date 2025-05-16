@@ -1,6 +1,8 @@
 
 #include "spiflash.h"
 #include <stdio.h>
+#include "string.h"
+#include "stm32g4xx_ll_gpio.h"
 
 static uint32_t flash_wait_for_ready(SPI_HandleTypeDef* hspi);
 static void flash_write_enable(SPI_HandleTypeDef* hspi);
@@ -26,8 +28,8 @@ extern SPI_HandleTypeDef hspi3;
 #define FLASH_WIP_BIT             0x01
 
 // Chip Select control macros
-#define FLASH_CS_LOW()    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4, GPIO_PIN_RESET)  // <-- Adjust your CS pin
-#define FLASH_CS_HIGH()   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_4, GPIO_PIN_SET)
+#define FLASH_CS_LOW()    LL_GPIO_ResetOutputPin(GPIOB, GPIO_PIN_4)  // <-- Adjust your CS pin
+#define FLASH_CS_HIGH()   LL_GPIO_SetOutputPin(GPIOB, GPIO_PIN_4)
 
 // Helper: Wait until flash is ready
 uint32_t flash_read_status(SPI_HandleTypeDef* hspi)
@@ -94,7 +96,6 @@ static void flash_write_enable(SPI_HandleTypeDef* hspi)
     FLASH_CS_LOW();
     HAL_SPI_Transmit(hspi, &cmd, 1, HAL_MAX_DELAY);
     FLASH_CS_HIGH();
-    flash_wait_for_ready(hspi);
 }
 
 
@@ -297,33 +298,29 @@ volatile int flash_dma_busy = 0;
 // You can optionally point this to your own handler
 __attribute__((weak)) void flash_dma_done_handler(void)
 {
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_RESET);
 }
+
 
 // Call this to start the flash program
-void flash_page_program_dma_async(uint32_t address, const void *data, uint32_t length, SPI_HandleTypeDef* hspi)
+// length: payload lenth. The array itself is sized length+4
+void flash_page_program_dma_async(uint32_t address, void *data, uint32_t payload_length, SPI_HandleTypeDef* hspi)
 {
-    if (length > SPIFLASH_PAGE_SIZE) return;
+    if (payload_length > SPIFLASH_PAGE_SIZE) return;
 
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_5, GPIO_PIN_SET);
-    static uint8_t tx_buf[SPIFLASH_PAGE_SIZE + 4];
-    uint8_t cmd[4] = {
-        FLASH_CMD_PAGE_PROGRAM,
-        (uint8_t)(address >> 16),
-        (uint8_t)(address >> 8),
-        (uint8_t)(address >> 0)
-    };
+    uint8_t* ptr_data = data;
+    ptr_data[0] = FLASH_CMD_PAGE_PROGRAM;
+    ptr_data[1] = address >> 16;
+    ptr_data[2] = address >> 8;
+    ptr_data[3] = address;
 
-    memcpy(tx_buf, cmd, 4);
-    memcpy(&tx_buf[4], data, length);
-
-    flash_write_enable(hspi);
+    flash_write_enable(hspi);  // 21.0529us, 6.4588us after removing wait_ready
 
     FLASH_CS_LOW();
-
     flash_dma_busy = 1;  // Mark transfer in progress
-    HAL_SPI_Transmit_DMA(hspi, tx_buf, length + 4);
+
+    HAL_SPI_Transmit_DMA(hspi, ptr_data, payload_length + 4);   // 3.9 us
 }
+
 
 // Hook into HAL's DMA complete callback
 void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi)
@@ -340,11 +337,7 @@ void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi)
         flash_dma_done_handler();
     }
 }
-
-
-
-
-
+/********************************************************************************************************************************/
 
 
 // Public: Erase 4K sector
@@ -377,7 +370,9 @@ uint32_t flash_read_jedec_id(SPI_HandleTypeDef* hspi)
     HAL_SPI_Receive(hspi, id, 3, HAL_MAX_DELAY);
     FLASH_CS_HIGH();
 
+#ifdef SPIFLASH_VERBOSE
     printf("Flash JEDEC ID: %02X %02X %02X\n", id[0], id[1], id[2]);
+#endif
 
     devid |= ( (uint32_t)(id[0]) << 16 );
     devid |= ( (uint32_t)(id[1]) << 8 );

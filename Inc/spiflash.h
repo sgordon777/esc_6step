@@ -21,7 +21,7 @@ void flash_read_poll(uint32_t address, void *buffer, uint32_t length, SPI_Handle
 void flash_read_dma(uint32_t address, void *buffer, uint32_t length, SPI_HandleTypeDef* hspi);
 void flash_page_program_poll(uint32_t address, const void *data, uint32_t length, SPI_HandleTypeDef* hspi);
 void flash_page_program_dma(uint32_t address, const void *data, uint32_t length, SPI_HandleTypeDef* hspi);
-void flash_page_program_dma_async(uint32_t address, const void *data, uint32_t length, SPI_HandleTypeDef* hspi);
+void flash_page_program_dma_async(uint32_t address, void *data, uint32_t payload_length, SPI_HandleTypeDef* hspi);
 void flash_erase_sector(uint32_t address, SPI_HandleTypeDef* hspi);
 void flash_erase_chip(SPI_HandleTypeDef* hspi);
 uint32_t flash_read_jedec_id(SPI_HandleTypeDef* hspi);
